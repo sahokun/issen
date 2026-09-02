@@ -1,0 +1,46 @@
+[package]
+name = "issen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace]
+# Non-virtual workspace (the root package is `issen` itself).
+# `plugin-example` is a sample plugin DLL and isn't included in release zips.
+members = ["plugin-api", "plugin-example"]
+
+[dependencies]
+abi_stable = "0.11"
+issen-plugin-api = { path = "plugin-api" }
+arboard = { version = "3", default-features = false, features = ["windows-sys"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.36"
+raw-window-handle = "0.6"
+regex = "1"
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+tray-icon = "0.24"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_EnhancedStorage",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
