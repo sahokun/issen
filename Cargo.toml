@@ -14,14 +14,19 @@ members = ["plugin-api", "plugin-example"]
 abi_stable = "0.11"
 issen-plugin-api = { path = "plugin-api" }
 arboard = { version = "3", default-features = false, features = ["windows-sys"] }
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
-egui = "0.36"
+futures = "0.3"
+# pre-1.0でcrates.io版にはgpui_platform/gpui_windowsが無いため、
+# zed-industries/zed mainの特定コミットをrevで固定して使う(Phase 0スパイクで
+# 実機検証済み — docs/architecture/window-lifecycle.md参照)。
+gpui = { git = "https://github.com/zed-industries/zed", rev = "c3cf80c0d1be43f3b84e21ef2c82e91b0d78e788" }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "c3cf80c0d1be43f3b84e21ef2c82e91b0d78e788" }
 raw-window-handle = "0.6"
 regex = "1"
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 tray-icon = { version = "0.24", default-features = false }
+unicode-segmentation = "1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
@@ -38,14 +43,6 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
-
-[dev-dependencies]
-# GPUI移行(egui/eframe→GPUI)のPhase 0実機スパイク専用。examples/gpui_spike.rs
-# のみが依存する。pre-1.0でcrates.io版にはgpui_platform/gpui_windowsが無い
-# ため、zed-industries/zed mainの特定コミットをrevで固定して使う。
-gpui = { git = "https://github.com/zed-industries/zed", rev = "c3cf80c0d1be43f3b84e21ef2c82e91b0d78e788" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "c3cf80c0d1be43f3b84e21ef2c82e91b0d78e788" }
-unicode-segmentation = "1"
 
 [profile.release]
 opt-level = "s"

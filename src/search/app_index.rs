@@ -199,8 +199,11 @@ impl IndexScan {
         }
     }
 
-    pub fn try_recv(&self) -> Option<AppIndexProvider> {
-        self.receiver.try_recv().ok()
+    /// Hands off the receiver so a GPUI `cx.spawn` task can block-wait on it
+    /// (on a background executor thread) instead of polling `try_recv` every
+    /// frame — see `app.rs::start_scan`.
+    pub fn into_receiver(self) -> Receiver<AppIndexProvider> {
+        self.receiver
     }
 }
 

@@ -27,15 +27,16 @@
 //! 不足のためビルド不可 — Windows側のPowerShellで実行すること)。
 
 use gpui::{
-    App, Bounds, Context, FocusHandle, Focusable, KeyBinding, Render, Window, WindowBackgroundAppearance,
-    WindowBounds, WindowKind, WindowOptions, actions, div, prelude::*, px, rgba, size, white,
+    actions, div, prelude::*, px, rgba, size, white, App, Bounds, Context, FocusHandle, Focusable,
+    KeyBinding, Render, Window, WindowBackgroundAppearance, WindowBounds, WindowKind,
+    WindowOptions,
 };
 use gpui_platform::application;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, GetWindowRect, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
-    SetWindowLongPtrW, SetWindowPos, WS_EX_TOOLWINDOW,
+    GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, WS_EX_TOOLWINDOW,
 };
 
 actions!(gpui_spike, [ToggleOffscreen, ToggleToolWindow, Quit]);
@@ -91,7 +92,15 @@ impl SpikeWindow {
             (ONSCREEN_X, ONSCREEN_Y)
         };
         unsafe {
-            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
         // GetWindowRectで実際にOS側の位置がSetWindowPos通りに動いたかを確認しつつ、
         // window.bounds()(GPUI内部のoriginキャッシュ、WM_MOVE経由で更新されるはず)
@@ -108,12 +117,22 @@ impl SpikeWindow {
         );
     }
 
-    fn toggle_offscreen(&mut self, _: &ToggleOffscreen, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_offscreen(
+        &mut self,
+        _: &ToggleOffscreen,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.do_toggle_offscreen(window);
         cx.notify();
     }
 
-    fn toggle_tool_window(&mut self, _: &ToggleToolWindow, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_tool_window(
+        &mut self,
+        _: &ToggleToolWindow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(hwnd) = Self::hwnd(window) else {
             return;
         };
@@ -127,7 +146,10 @@ impl SpikeWindow {
             };
             let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_style);
         }
-        println!("[spike] toggle_tool_window -> is_tool_window={}(タスクバー/Alt+Tabを目視確認)", self.is_tool_window);
+        println!(
+            "[spike] toggle_tool_window -> is_tool_window={}(タスクバー/Alt+Tabを目視確認)",
+            self.is_tool_window
+        );
         cx.notify();
     }
 

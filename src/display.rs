@@ -24,6 +24,9 @@ pub fn position_on_cursor_monitor(window_size: (f32, f32)) -> Option<(f32, f32)>
 /// the given point sits on (`ISSEN_DEBUG_FORCE_MONITOR_POINT`). Doesn't depend on
 /// `GetCursorPos`, so a screen-capture harness can target an arbitrary display at a
 /// predictable coordinate.
+// Not yet called from `app.rs`'s GPUI build — `ISSEN_DEBUG_FORCE_MONITOR_POINT`
+// support hasn't been ported over yet.
+#[allow(dead_code)]
 pub fn position_on_point_monitor(point: (i32, i32), window_size: (f32, f32)) -> Option<(f32, f32)> {
     unsafe {
         let p = POINT {

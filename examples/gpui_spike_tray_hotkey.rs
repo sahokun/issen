@@ -27,19 +27,23 @@
 //!
 //! 実行: `cargo run --example gpui_spike_tray_hotkey`(Windows専用)。
 
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 
-use gpui::{App, Bounds, Context, Render, Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions, div, prelude::*, px, rgba, size, white};
+use gpui::{
+    div, prelude::*, px, rgba, size, white, App, Bounds, Context, Render, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+};
 use gpui_platform::application;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem};
 use tray_icon::{Icon, MouseButton as TrayMouseButton, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{MOD_ALT, MOD_NOREPEAT, RegisterHotKey};
+use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, MOD_ALT, MOD_NOREPEAT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetMessageW, GetWindowRect, MSG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos, WM_HOTKEY,
+    GetMessageW, GetWindowRect, SetWindowPos, MSG, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    WM_HOTKEY,
 };
 
 const OFFSCREEN_X: i32 = -10000;
@@ -137,11 +141,22 @@ impl SpikeWindow {
             (ONSCREEN_X, ONSCREEN_Y)
         };
         unsafe {
-            let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
         }
         let mut rect = RECT::default();
         let ok = unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok();
-        println!("[spike] toggle -> is_offscreen={} os_rect_ok={} rect=({},{})", self.is_offscreen, ok, rect.left, rect.top);
+        println!(
+            "[spike] toggle -> is_offscreen={} os_rect_ok={} rect=({},{})",
+            self.is_offscreen, ok, rect.left, rect.top
+        );
     }
 
     /// 各種イベントソース(ホットキー・トレイメニュー・トレイアイコン
@@ -167,7 +182,11 @@ impl SpikeWindow {
         if let Some(rx) = TRAY_ICON_EVENTS.get() {
             if let Ok(rx) = rx.lock() {
                 while let Ok(event) = rx.try_recv() {
-                    if let TrayIconEvent::Click { button: TrayMouseButton::Left, .. } = event {
+                    if let TrayIconEvent::Click {
+                        button: TrayMouseButton::Left,
+                        ..
+                    } = event
+                    {
                         println!("[spike] tray icon left click");
                         self.do_toggle(window);
                     }
@@ -195,7 +214,10 @@ impl Render for SpikeWindow {
             .child("Alt+Space or tray icon click to toggle offscreen")
             .child(format!("is_offscreen: {}", self.is_offscreen))
             .child(format!("window.bounds(): {:?}", window.bounds()))
-            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, window, _| this.do_toggle(window)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, _| this.do_toggle(window)),
+            )
     }
 }
 

@@ -87,6 +87,9 @@ impl History {
     }
 
     /// Called from the right-click menu's "unpin".
+    // Not yet called — the right-click context menu isn't ported to GPUI yet
+    // (Phase 1 step 4, see docs/architecture/ui-appearance.md).
+    #[allow(dead_code)]
     pub fn remove(&mut self, key: &str) {
         self.entries.retain(|e| e.key != key);
     }
@@ -96,6 +99,7 @@ impl History {
     /// count accumulated through actual runs — it only adds a new entry at
     /// `use_count: 0` if one doesn't already exist (a no-op if already
     /// pinned).
+    #[allow(dead_code)]
     pub fn pin(&mut self, key: &str) {
         if self.entries.iter().any(|e| e.key == key) {
             return;

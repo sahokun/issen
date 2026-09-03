@@ -139,6 +139,9 @@ impl Config {
             .unwrap_or_default()
     }
 
+    // Not yet called — will be used once the settings window (Phase 1 step 4)
+    // has something to save.
+    #[allow(dead_code)]
     pub fn save(&self, app_name: &str) -> std::io::Result<()> {
         let path = Self::config_path(app_name).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "%APPDATA% is not set")
