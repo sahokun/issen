@@ -162,6 +162,18 @@ impl IssenApp {
     ) -> Self {
         let main_hwnd = window_hwnd(window).expect("failed to obtain main window HWND");
         set_tool_window_style(main_hwnd);
+        // `WindowOptions.window_bounds`'s origin/size aren't reliably honored
+        // when the window is created off-screen at a large negative origin
+        // (observed on real hardware: the window came up full-monitor-width
+        // and on-screen instead of at `OFFSCREEN_POSITION`/`MAIN_WINDOW_SIZE`).
+        // Force both explicitly via the same raw Win32 calls `hide` uses,
+        // rather than trusting `WindowOptions` for the off-screen case.
+        window.resize(size(px(MAIN_WINDOW_SIZE.0), px(MAIN_WINDOW_SIZE.1)));
+        move_window(
+            main_hwnd,
+            OFFSCREEN_POSITION.0 as i32,
+            OFFSCREEN_POSITION.1 as i32,
+        );
 
         let lang = i18n::resolve(config.language);
         let strings = Strings::for_lang(lang);
