@@ -10,10 +10,12 @@
 //!     使わず、ホットキー/トレイイベントは`futures::channel::mpsc`と
 //!     `App::spawn`によるイベント駆動の待受けにしている
 //!     (`hotkey.rs`/`tray.rs`のAPIもこの前提でegui非依存に書き換え済み)。
-//!   - aboutウィンドウ(`about_window.rs`)を移植済み。settings/toolsウィンドウ、
-//!     右クリックコンテキストメニュー、クエリ履歴パネル、起動時の合成
-//!     フリッカー対策(layered prime)、show/hideのフェードインアニメーションは
-//!     未移植(Phase 1の後続ステップで追加予定)。トレイの「設定」は現状ログのみ。
+//!   - about/settingsウィンドウ(`about_window.rs`/`settings_window.rs`)を
+//!     移植済み。設定のテキスト入力欄は`text_input.rs`の汎用`TextInput`
+//!     エンティティを再利用している。toolsウィンドウ、右クリックコンテキスト
+//!     メニュー、クエリ履歴パネル、起動時の合成フリッカー対策(layered prime)、
+//!     show/hideのフェードインアニメーションは未移植(Phase 1の後続ステップで
+//!     追加予定)。
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -102,9 +104,9 @@ enum ResultActionKind {
 }
 
 pub struct IssenApp {
-    config: Config,
+    pub(crate) config: Config,
     lang: Lang,
-    strings: &'static Strings,
+    pub(crate) strings: &'static Strings,
 
     // Search box text-input state (see `EntityInputHandler` impl below).
     focus_handle: FocusHandle,
@@ -126,19 +128,18 @@ pub struct IssenApp {
     visible: bool,
 
     // Kept alive so its listener thread (and the global hotkey registration
-    // it holds) isn't torn down. Not yet read from — `update_hotkey` will be
-    // wired up once the settings window (which lets the hotkey be changed)
-    // is ported to GPUI (Phase 1 step 4).
-    #[allow(dead_code)]
-    hotkey: HotkeyListener,
-    tray: TrayHandle,
+    // it holds) isn't torn down. `update_hotkey` is called live from the
+    // settings window's hotkey field (`settings_window.rs`).
+    pub(crate) hotkey: HotkeyListener,
+    pub(crate) tray: TrayHandle,
     about_window: Option<WindowHandle<AboutWindow>>,
+    settings_window: Option<WindowHandle<crate::settings_window::SettingsWindow>>,
     app_index: AppIndexProvider,
     history: crate::history::History,
     plugins: PluginProvider,
-    scanning: bool,
-    last_scan_finished: Option<Instant>,
-    last_scan_count: usize,
+    pub(crate) scanning: bool,
+    pub(crate) last_scan_finished: Option<Instant>,
+    pub(crate) last_scan_count: usize,
     next_periodic_scan: Instant,
 
     main_hwnd: HWND,
@@ -191,6 +192,7 @@ impl IssenApp {
             hotkey,
             tray,
             about_window: None,
+            settings_window: None,
             app_index: AppIndexProvider::empty(),
             history: crate::history::History::load_or_default(config::APP_NAME),
             plugins: PluginProvider::load_from_app_data(),
@@ -201,7 +203,7 @@ impl IssenApp {
             main_hwnd,
             config,
         };
-        app.start_scan(window, cx);
+        app.start_scan(cx);
         app
     }
 
@@ -233,12 +235,14 @@ impl IssenApp {
         self.selected = 0;
     }
 
-    /// Entry point for both the initial startup scan and a manual reindex.
+    /// Entry point for both the initial startup scan and a manual reindex
+    /// (including from the settings window — a separate GPUI `Window`, so
+    /// this deliberately doesn't take `&mut Window` itself; see below).
     /// No-op if a scan is already running. Unlike the egui/eframe version's
     /// `poll_scan` (called every frame from `logic()`), completion is
     /// awaited by a `cx.spawn` task that blocks on the scan's channel from a
-    /// background executor thread and wakes this window once — no polling.
-    fn start_scan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// background executor thread and wakes this view once — no polling.
+    pub(crate) fn start_scan(&mut self, cx: &mut Context<Self>) {
         if self.scanning {
             return;
         }
@@ -248,37 +252,27 @@ impl IssenApp {
         self.scanning = true;
         self.tray.set_scanning(self.strings, true);
 
-        // Fully-qualified: `Window` has an inherent `window_handle()` (returns
-        // `AnyWindowHandle`) that's shadowed in method-call position by
-        // `raw_window_handle::HasWindowHandle`'s same-named trait method
-        // (imported for `window_hwnd` below) — see that function's doc comment.
-        let window_handle = Window::window_handle(window)
-            .downcast::<Self>()
-            .expect("root view is IssenApp");
         // `Context::spawn` (unlike `App::spawn`) hands the async closure a
-        // `WeakEntity<Self>` as well as `&mut AsyncApp`; unused here since
-        // `window_handle` (captured below) is used to get back into this view.
-        cx.spawn(async move |_this, cx| {
+        // `WeakEntity<Self>`, used to get back into this view once the scan
+        // finishes — no `&mut Window` needed for that (`on_scan_finished`
+        // doesn't touch the window), which is what lets a *different*
+        // window's event handler (settings' Rescan button) call this.
+        cx.spawn(async move |this, cx| {
             let receiver = scan.into_receiver();
             let provider = cx
                 .background_executor()
                 .spawn(async move { receiver.recv().ok() })
                 .await;
             if let Some(provider) = provider {
-                let _ = window_handle.update(cx, |view, window, cx| {
-                    view.on_scan_finished(provider, window, cx);
+                let _ = this.update(cx, |view, cx| {
+                    view.on_scan_finished(provider, cx);
                 });
             }
         })
         .detach();
     }
 
-    fn on_scan_finished(
-        &mut self,
-        provider: AppIndexProvider,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_scan_finished(&mut self, provider: AppIndexProvider, cx: &mut Context<Self>) {
         self.last_scan_count = provider.len();
         self.last_scan_finished = Some(Instant::now());
         self.app_index = provider;
@@ -287,6 +281,33 @@ impl IssenApp {
         self.next_periodic_scan = Instant::now() + PERIODIC_RESCAN_INTERVAL;
         if !self.query.is_empty() {
             self.run_search();
+        }
+        cx.notify();
+    }
+
+    /// Rebuilds runtime state that depends on `config.language` (display
+    /// strings, tray icon) when it changes. Called directly from the
+    /// settings window's language row on click — unlike the egui/eframe
+    /// version's `apply_language` (called unconditionally every frame),
+    /// there's no per-frame polling here, so this only needs to run once
+    /// per actual change, at the point the change happens.
+    pub(crate) fn apply_language(&mut self, cx: &mut Context<Self>) {
+        let lang = i18n::resolve(self.config.language);
+        if lang == self.lang {
+            cx.notify();
+            return;
+        }
+        self.lang = lang;
+        self.strings = Strings::for_lang(lang);
+        // Keep the existing tray icon if rebuilding fails (its labels stay
+        // in the old language, but that's better than crashing the app).
+        if let Some(tray) = TrayHandle::new(self.strings) {
+            self.tray = tray;
+            if self.scanning {
+                self.tray.set_scanning(self.strings, true);
+            }
+        } else {
+            eprintln!("issen: failed to rebuild tray icon after language change; keeping old one");
         }
         cx.notify();
     }
@@ -426,12 +447,27 @@ impl IssenApp {
         match action {
             TrayAction::Open => self.show(window, cx),
             TrayAction::Settings => {
-                // TODO(Phase 1 step 4): settings window not yet ported to GPUI.
-                eprintln!("issen: settings window not yet implemented in the GPUI build");
+                // Matches the egui/eframe version: the tray's Settings
+                // action also brings the main search window up (it's the
+                // only route to Settings that can fire while the main
+                // window is still hidden).
                 self.show(window, cx);
+                let weak = cx.weak_entity();
+                let snapshot = crate::settings_window::AppSnapshot {
+                    config: self.config.clone(),
+                    strings: self.strings,
+                    scanning: self.scanning,
+                    last_scan_finished: self.last_scan_finished,
+                    last_scan_count: self.last_scan_count,
+                };
+                crate::settings_window::open(&mut self.settings_window, weak, snapshot, cx);
             }
-            TrayAction::Reindex => self.start_scan(window, cx),
+            TrayAction::Reindex => self.start_scan(cx),
             TrayAction::About => {
+                // Matches the egui/eframe version: the tray's About action also
+                // brings the main search window up (it's the only route to
+                // About that can fire while the main window is still hidden).
+                self.show(window, cx);
                 about_window::open(&mut self.about_window, self.strings, self.config.theme, cx);
             }
         }
@@ -1270,6 +1306,7 @@ pub fn run(config: Config) {
             KeyBinding::new("ctrl-x", Cut, Some(KEY_CONTEXT)),
             KeyBinding::new("ctrl-c", Copy, Some(KEY_CONTEXT)),
         ]);
+        cx.bind_keys(crate::text_input::key_bindings());
 
         let bounds = Bounds {
             origin: gpui::point(px(OFFSCREEN_POSITION.0), px(OFFSCREEN_POSITION.1)),
@@ -1339,6 +1376,11 @@ pub fn run(config: Config) {
         if std::env::var_os("ISSEN_DEBUG_OPEN_ABOUT").is_some() {
             let _ = window_handle.update(cx, |view, window, cx| {
                 view.handle_tray_action(TrayAction::About, window, cx)
+            });
+        }
+        if std::env::var_os("ISSEN_DEBUG_OPEN_SETTINGS").is_some() {
+            let _ = window_handle.update(cx, |view, window, cx| {
+                view.handle_tray_action(TrayAction::Settings, window, cx)
             });
         }
 

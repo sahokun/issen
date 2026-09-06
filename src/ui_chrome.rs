@@ -8,8 +8,50 @@ use gpui::{
     div, hsla, px, rgba, Div, Hsla, InteractiveElement, MouseButton, ParentElement, SharedString,
     Styled, Window, WindowAppearance,
 };
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+};
 
 use crate::config::Theme;
+
+/// `Window` has an inherent `window_handle()` method (returns GPUI's own
+/// `AnyWindowHandle`, not an HWND) with the same name as the
+/// `HasWindowHandle` trait method, so the trait method must be called
+/// fully-qualified to get the actual HWND (same gotcha as `app.rs`'s
+/// private copy of this for the main window).
+pub fn window_hwnd(window: &Window) -> Option<HWND> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut core::ffi::c_void)),
+        _ => None,
+    }
+}
+
+/// Puts a secondary window in the OS topmost band. Needed because the main
+/// search window (`app.rs::run`) is itself always-on-top
+/// (`WindowKind::PopUp` there doesn't imply topmost on Windows) — without
+/// this, a secondary window opened while the main window is visible ends up
+/// behind it. GPUI's `WindowOptions` has no cross-platform equivalent, so
+/// this goes straight to the same raw `SetWindowPos` call the egui/eframe
+/// version used via `.with_always_on_top()`.
+pub fn set_topmost(window: &Window) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
 
 /// Resolves `config.theme` to an actual dark/light bool: `Light`/`Dark` are
 /// explicit overrides, `System` follows the window's real OS appearance.

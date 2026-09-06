@@ -25,13 +25,7 @@ pub struct HotkeyListener {
     /// read from within the thread itself). `update_hotkey` is never
     /// realistically called before that happens, but `0` is treated as
     /// "not yet received" and ignored just in case.
-    ///
-    /// Both fields are currently only read by `update_hotkey`, which isn't
-    /// called anywhere yet — the settings window that would call it (on a
-    /// hotkey field edit) isn't ported to GPUI yet (Phase 1 step 4).
-    #[allow(dead_code)]
     thread_id: u32,
-    #[allow(dead_code)]
     update_tx: Sender<String>,
 }
 
@@ -125,7 +119,6 @@ impl HotkeyListener {
     /// change immediately). If `new_spec` doesn't currently parse (e.g. a
     /// partial in-progress string), this doesn't error — the listener
     /// thread checks it and ignores it (see `spawn`'s doc comment).
-    #[allow(dead_code)] // not yet called — see the doc comment on `HotkeyListener`'s fields.
     pub fn update_hotkey(&self, new_spec: String) {
         if self.thread_id == 0 {
             return;

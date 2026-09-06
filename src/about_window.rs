@@ -60,7 +60,10 @@ pub fn open(
                 window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
-            move |_window, cx| cx.new(|_cx| AboutWindow { strings, theme }),
+            move |window, cx| {
+                ui_chrome::set_topmost(window);
+                cx.new(|_cx| AboutWindow { strings, theme })
+            },
         )
         .expect("failed to open about window");
     *existing = Some(handle);
