@@ -6,6 +6,7 @@
 // the handler never fires). Losing Ctrl+C during development outweighs the stray
 // console window here; use the tray's "Quit" instead if this bothers you.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod about_window;
 mod app;
 mod config;
 mod display;
@@ -16,13 +17,13 @@ mod launch;
 mod search;
 mod single_instance;
 mod tray;
+mod ui_chrome;
 // GPUI移行(egui/eframe→GPUI)のPhase 1着手に伴い、egui依存のこれらは一時的に
-// コンパイル対象から外している。Phase 1 step3/4でGPUI版に書き直して復活させる
-// 予定(docs/architecture配下のGPUI移行計画を参照)。ファイル自体は削除していない。
+// コンパイル対象から外している。GPUI版に書き直して順次復活させる予定
+// (詳細はapp.rsのモジュールdocコメント参照)。ファイル自体は削除していない。
 // mod fonts;
 // mod settings_window;
 // mod tools;
-// mod ui_chrome;
 
 fn main() {
     if single_instance::is_already_running() {

@@ -44,6 +44,14 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[profile.dev]
+# GPUI移行後、フルデバッグ情報(デフォルトのdebug=2)だとリンク時に
+# issen.pdbが300MB超まで膨れ上がり、Windows実機でリンクがハングする
+# (link.exeがWindows Defenderのリアルタイムスキャンと競合してファイル
+# ロックが解放されず、プロセスをkillしてもロックが残る事例を確認)。
+# 行番号情報だけに絞ってPDBサイズを大幅に削減する。
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = "s"
 lto = true

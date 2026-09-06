@@ -10,22 +10,22 @@
 //!     使わず、ホットキー/トレイイベントは`futures::channel::mpsc`と
 //!     `App::spawn`によるイベント駆動の待受けにしている
 //!     (`hotkey.rs`/`tray.rs`のAPIもこの前提でegui非依存に書き換え済み)。
-//!   - settings/tools/aboutウィンドウ、右クリックコンテキストメニュー、
-//!     クエリ履歴パネル、起動時の合成フリッカー対策(layered prime)、
-//!     show/hideのフェードインアニメーションは未移植(Phase 1の後続ステップ
-//!     で追加予定)。トレイの「設定」「バージョン情報」は現状ログのみ。
+//!   - aboutウィンドウ(`about_window.rs`)を移植済み。settings/toolsウィンドウ、
+//!     右クリックコンテキストメニュー、クエリ履歴パネル、起動時の合成
+//!     フリッカー対策(layered prime)、show/hideのフェードインアニメーションは
+//!     未移植(Phase 1の後続ステップで追加予定)。トレイの「設定」は現状ログのみ。
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, rgba, size, white, App, AppContext, Bounds,
+    actions, div, fill, hsla, point, prelude::*, px, size, white, App, AppContext, Bounds,
     ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
+    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use gpui_platform::application;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -36,6 +36,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, WS_EX_TOOLWINDOW,
 };
 
+use crate::about_window::{self, AboutWindow};
 use crate::config::{self, Config};
 use crate::hotkey::HotkeyListener;
 use crate::i18n::{self, Lang, Strings};
@@ -46,6 +47,7 @@ use crate::search::plugin::PluginProvider;
 use crate::search::windows_settings::WindowsSettingsProvider;
 use crate::search::{Action, SearchProvider, SearchResult};
 use crate::tray::{self, TrayAction, TrayHandle};
+use crate::ui_chrome;
 
 /// Main window size (zero-results height). See `docs/architecture/window-lifecycle.md`.
 pub const MAIN_WINDOW_SIZE: (f32, f32) = (640.0, 60.0);
@@ -57,17 +59,6 @@ const RESULT_RETENTION_CAP: usize = 50;
 const RESULT_ROW_HEIGHT: f32 = 40.0;
 const CONTENT_PADDING: f32 = 16.0;
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(30 * 60);
-
-fn accent_color(theme: config::AccentColor) -> Hsla {
-    use config::AccentColor;
-    match theme {
-        AccentColor::Lime => rgba(0xC4F252FF).into(),
-        AccentColor::Red => rgba(0xFF746EFF).into(),
-        AccentColor::Orange => rgba(0xFFA63DFF).into(),
-        AccentColor::Blue => rgba(0x6CC3FFFF).into(),
-        AccentColor::Purple => rgba(0xD798FFFF).into(),
-    }
-}
 
 actions!(
     issen,
@@ -141,6 +132,7 @@ pub struct IssenApp {
     #[allow(dead_code)]
     hotkey: HotkeyListener,
     tray: TrayHandle,
+    about_window: Option<WindowHandle<AboutWindow>>,
     app_index: AppIndexProvider,
     history: crate::history::History,
     plugins: PluginProvider,
@@ -198,6 +190,7 @@ impl IssenApp {
             visible: false,
             hotkey,
             tray,
+            about_window: None,
             app_index: AppIndexProvider::empty(),
             history: crate::history::History::load_or_default(config::APP_NAME),
             plugins: PluginProvider::load_from_app_data(),
@@ -439,9 +432,7 @@ impl IssenApp {
             }
             TrayAction::Reindex => self.start_scan(window, cx),
             TrayAction::About => {
-                // TODO(Phase 1 step 4): about window not yet ported to GPUI.
-                eprintln!("issen: about window not yet implemented in the GPUI build");
-                self.show(window, cx);
+                about_window::open(&mut self.about_window, self.strings, self.config.theme, cx);
             }
         }
     }
@@ -992,7 +983,7 @@ impl Element for TextElement {
                         point(bounds.left() + cursor_pos, bounds.top()),
                         size(px(2.), bounds.bottom() - bounds.top()),
                     ),
-                    accent_color(self.input.read(cx).config.accent_color),
+                    ui_chrome::accent_color(self.input.read(cx).config.accent_color),
                 )),
             )
         } else {
@@ -1067,7 +1058,7 @@ impl Render for IssenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_window_height(window);
 
-        let accent = accent_color(self.config.accent_color);
+        let accent = ui_chrome::accent_color(self.config.accent_color);
         let glass_bg = hsla(220. / 360., 0.12, 0.09, 0.88);
         let visible_rows_cap = self.visible_rows_cap();
 
@@ -1340,6 +1331,15 @@ pub fn run(config: Config) {
                 }
             })
             .detach();
+        }
+
+        // Opens the about window at startup, via the same tray-action path a
+        // real click takes, for manual visual verification without needing
+        // tray-icon UI automation.
+        if std::env::var_os("ISSEN_DEBUG_OPEN_ABOUT").is_some() {
+            let _ = window_handle.update(cx, |view, window, cx| {
+                view.handle_tray_action(TrayAction::About, window, cx)
+            });
         }
 
         cx.activate(true);
