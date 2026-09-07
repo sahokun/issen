@@ -38,8 +38,8 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use unicode_segmentation::UnicodeSegmentation;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE, SWP_NOACTIVATE, SWP_NOSIZE,
-    SWP_NOZORDER, WS_EX_TOOLWINDOW,
+    GetForegroundWindow, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_TOOLWINDOW,
 };
 
 use crate::about_window::{self, AboutWindow};
@@ -480,7 +480,19 @@ impl IssenApp {
             return;
         }
         self.visible = true;
-        self.seen_active_since_show = false;
+        // `hide()` never relinquishes OS foreground (`SWP_NOACTIVATE` on its
+        // `move_window` call — see its doc comment), so if nothing else took
+        // foreground while this window sat parked offscreen since the last
+        // cycle, it's *already* the OS-active window here. In that case the
+        // `activate_window()` call below is a no-op transition and never
+        // fires `WM_ACTIVATE(true)`, which would otherwise leave
+        // `seen_active_since_show` stuck at `false` for this whole cycle —
+        // permanently disabling the focus-loss auto-hide below (its
+        // deactivation guard never sees the "was active" flag it's waiting
+        // for). Seed it directly from the real OS state instead of only
+        // ever setting it from an activation event that, in this specific
+        // case, will never arrive.
+        self.seen_active_since_show = window_is_foreground(self.main_hwnd);
         let target = self.resolve_show_target();
         move_window(self.main_hwnd, target.0 as i32, target.1 as i32);
         // `window.focus` only moves GPUI's own internal notion of which view
@@ -1946,6 +1958,14 @@ fn move_window(hwnd: HWND, x: i32, y: i32) {
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
+}
+
+/// Whether `hwnd` is the OS's current foreground window right now. Used by
+/// `show()` to seed `seen_active_since_show` without waiting for an
+/// activation event — see that call site's doc comment for why an event
+/// alone isn't always enough.
+fn window_is_foreground(hwnd: HWND) -> bool {
+    unsafe { GetForegroundWindow() == hwnd }
 }
 
 /// App entry point, called from `main.rs`.
