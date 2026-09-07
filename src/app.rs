@@ -1653,8 +1653,8 @@ impl Render for IssenApp {
         self.sync_window_height(window);
 
         let accent = ui_chrome::accent_color(self.config.accent_color);
-        // 0.88だと背景が透けすぎるとの指摘を受け、やや不透明側に寄せた。
-        let glass_bg = hsla(220. / 360., 0.12, 0.09, 0.94);
+        // 実機確認の結果、0.80が好みの透け具合として指定された。
+        let glass_bg = hsla(220. / 360., 0.12, 0.09, 0.80);
         let visible_rows_cap = self.visible_rows_cap();
 
         let search_box = div()
