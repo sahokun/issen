@@ -229,6 +229,31 @@ impl SettingsWindow {
         }
     }
 
+    /// Prefills the "add alias" fields and switches to the Aliases tab —
+    /// called from the main window's result-row context menu ("Register as
+    /// alias"). Matches the egui/eframe version's `SettingsWindow::
+    /// prefill_alias` (which also cleared the args field and opened the
+    /// window; opening here is the caller's job, via `settings_window::open`,
+    /// since this window is now a separate OS window rather than an inline
+    /// viewport).
+    pub(crate) fn prefill_alias(
+        &mut self,
+        name: String,
+        target: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.new_alias_name_input
+            .update(cx, |input, cx| input.set_text(name, cx));
+        self.new_alias_target_input
+            .update(cx, |input, cx| input.set_text(target, cx));
+        self.new_alias_args_input
+            .update(cx, |input, cx| input.set_text("", cx));
+        self.tab = SettingsTab::Aliases;
+        window.activate_window();
+        cx.notify();
+    }
+
     fn add_folder_clicked(&mut self, cx: &mut Context<Self>) {
         if self.pending_folder_pick {
             return;

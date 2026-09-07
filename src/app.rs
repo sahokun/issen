@@ -13,20 +13,23 @@
 //!   - about/settings/toolsウィンドウ(`about_window.rs`/`settings_window.rs`/
 //!     `tools/mod.rs`)を移植済み。設定・toolsのテキスト入力欄は
 //!     `text_input.rs`の汎用`TextInput`エンティティを再利用している。
-//!     右クリックコンテキストメニュー、クエリ履歴パネル、起動時の合成
-//!     フリッカー対策(layered prime)、show/hideのフェードインアニメーションは
-//!     未移植(Phase 1の後続ステップで追加予定)。
+//!   - 右クリックコンテキストメニュー(GPUI本体に`context_menu`相当の完成品
+//!     ウィジェットが無いため、`anchored()`+`deferred()`による自作オーバーレイ)
+//!     とクエリ履歴パネルも移植済み。起動時の合成フリッカー対策(layered
+//!     prime)とshow/hideのフェードインアニメーションは、Phase 0スパイクで
+//!     GPUI自体にはちらつきが再発しないことを実機確認済みのため保留
+//!     (再発が実際に観測された場合のみ追加する)。
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    actions, div, fill, hsla, point, prelude::*, px, size, white, App, AppContext, Bounds,
-    ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine,
-    SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    actions, anchored, deferred, div, fill, hsla, point, prelude::*, px, size, white, AnyElement,
+    App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
+    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
+    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
 use gpui_platform::application;
@@ -62,6 +65,16 @@ const RESULT_RETENTION_CAP: usize = 50;
 const RESULT_ROW_HEIGHT: f32 = 40.0;
 const CONTENT_PADDING: f32 = 16.0;
 const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Extra window height added only while the right-click context menu is
+/// open. The main window is a single undecorated OS window, and the menu
+/// (a `deferred`/`anchored` overlay) can't physically render outside that
+/// window's own pixel bounds. With an empty query (window height =
+/// `MAIN_WINDOW_SIZE.1` only), right-clicking the input box would otherwise
+/// open a menu (up to 5 items + a separator) taller than the available 60px
+/// and get visibly cut off. Ported from the egui/eframe version's
+/// `CONTEXT_MENU_HEADROOM` (`ctx.any_popup_open()`-gated); here it's gated
+/// on `self.context_menu.is_some()` instead.
+const CONTEXT_MENU_HEADROOM: f32 = 220.0;
 
 actions!(
     issen,
@@ -104,6 +117,23 @@ enum ResultActionKind {
     OpenLocation,
 }
 
+/// What the open right-click context menu is for — the search box's own
+/// background (Settings/Reindex/Quit) or a specific result row (index into
+/// `IssenApp::results` at the time it was opened).
+#[derive(Clone, Copy)]
+enum ContextMenuTarget {
+    Main,
+    Row(usize),
+}
+
+#[derive(Clone, Copy)]
+struct OpenContextMenu {
+    target: ContextMenuTarget,
+    /// Window-space position the menu is anchored to (from the opening
+    /// `MouseDownEvent::position`).
+    position: Point<Pixels>,
+}
+
 pub struct IssenApp {
     pub(crate) config: Config,
     lang: Lang,
@@ -127,6 +157,16 @@ pub struct IssenApp {
     content_height: f32,
 
     visible: bool,
+
+    /// The query-history list (🕘 icon next to the input box). While open,
+    /// it's drawn in place of the normal result list, and keyboard shortcuts
+    /// that act on `results` (up/down, Enter, Alt+digit) are suspended —
+    /// `results` stays stale from the last real search while this is open.
+    history_panel_open: bool,
+    /// The open right-click context menu, if any (search box background or
+    /// a result row). GPUI core has no `context_menu` widget, so this is a
+    /// custom `anchored()`/`deferred()` overlay drawn in `render()`.
+    context_menu: Option<OpenContextMenu>,
 
     // Kept alive so its listener thread (and the global hotkey registration
     // it holds) isn't torn down. `update_hotkey` is called live from the
@@ -191,6 +231,8 @@ impl IssenApp {
             selected: 0,
             content_height: MAIN_WINDOW_SIZE.1,
             visible: false,
+            history_panel_open: false,
+            context_menu: None,
             hotkey,
             tray,
             about_window: None,
@@ -404,6 +446,8 @@ impl IssenApp {
         self.marked_range = None;
         self.results.clear();
         self.selected = 0;
+        self.history_panel_open = false;
+        self.context_menu = None;
         self.sync_window_height(window);
         cx.notify();
     }
@@ -424,12 +468,27 @@ impl IssenApp {
         .unwrap_or((100.0, 100.0))
     }
 
-    /// Syncs the window's actual OS height to the current result count.
-    /// Safe to call every frame (`Window::resize` is only invoked when the
-    /// value changes).
+    /// Syncs the window's actual OS height to the current result count (or,
+    /// while the history panel is open, the query-history row count — even
+    /// with zero history entries, one row ("no history yet") is still
+    /// drawn, hence `max(1)`). Adds `CONTEXT_MENU_HEADROOM` while the
+    /// right-click context menu is open, so it doesn't get cut off. Safe to
+    /// call every frame (`Window::resize` is only invoked when the value
+    /// changes).
     fn sync_window_height(&mut self, window: &mut Window) {
-        let rows = self.results.len().min(self.visible_rows_cap()) as f32;
-        let height = MAIN_WINDOW_SIZE.1 + rows * RESULT_ROW_HEIGHT;
+        let rows = if self.history_panel_open {
+            self.history
+                .queries
+                .len()
+                .max(1)
+                .min(self.visible_rows_cap())
+        } else {
+            self.results.len().min(self.visible_rows_cap())
+        } as f32;
+        let mut height = MAIN_WINDOW_SIZE.1 + rows * RESULT_ROW_HEIGHT;
+        if self.context_menu.is_some() {
+            height += CONTEXT_MENU_HEADROOM;
+        }
         if (self.content_height - height).abs() < f32::EPSILON {
             return;
         }
@@ -477,15 +536,7 @@ impl IssenApp {
                 // only route to Settings that can fire while the main
                 // window is still hidden).
                 self.show(window, cx);
-                let weak = cx.weak_entity();
-                let snapshot = crate::settings_window::AppSnapshot {
-                    config: self.config.clone(),
-                    strings: self.strings,
-                    scanning: self.scanning,
-                    last_scan_finished: self.last_scan_finished,
-                    last_scan_count: self.last_scan_count,
-                };
-                crate::settings_window::open(&mut self.settings_window, weak, snapshot, cx);
+                self.open_settings_window(cx);
             }
             TrayAction::Reindex => self.start_scan(cx),
             TrayAction::About => {
@@ -522,14 +573,109 @@ impl IssenApp {
         );
     }
 
+    /// Opens the settings window (or brings an already-open one to front),
+    /// building the `AppSnapshot` it needs from directly-accessible fields.
+    /// Shared by the tray's Settings action, the main context menu's
+    /// Settings item, and `register_selected_as_alias`.
+    fn open_settings_window(&mut self, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let snapshot = crate::settings_window::AppSnapshot {
+            config: self.config.clone(),
+            strings: self.strings,
+            scanning: self.scanning,
+            last_scan_finished: self.last_scan_finished,
+            last_scan_count: self.last_scan_count,
+        };
+        crate::settings_window::open(&mut self.settings_window, weak, snapshot, cx);
+    }
+
+    /// "Register as alias" from a result row's context menu: opens the
+    /// settings window and prefills its "add alias" fields with the
+    /// selected result's title/target. Matches the egui/eframe version's
+    /// `SettingsWindow::prefill_alias`.
+    fn register_selected_as_alias(&mut self, cx: &mut Context<Self>) {
+        let Some(result) = self.results.get(self.selected) else {
+            return;
+        };
+        let title = result.title.clone();
+        let target = crate::search::target_key(&result.action);
+        self.open_settings_window(cx);
+        if let Some(handle) = &self.settings_window {
+            let _ = handle.update(cx, |view, window, cx| {
+                view.prefill_alias(title, target, window, cx);
+            });
+        }
+    }
+
+    /// "Pin"/"Unpin" from a result row's context menu. Both rebuild via
+    /// `run_search` rather than patching the score in place, so the ranking
+    /// reflects the change immediately — matches the egui/eframe version's
+    /// `RowMenuAction::Pin`/`Unpin`.
+    fn pin_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(result) = self.results.get(self.selected) {
+            let key = crate::search::target_key(&result.action);
+            self.history.pin(&key);
+            if let Err(err) = self.history.save(config::APP_NAME) {
+                eprintln!("issen: failed to save history.toml: {err}");
+            }
+        }
+        self.run_search();
+        cx.notify();
+    }
+
+    fn unpin_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(result) = self.results.get(self.selected) {
+            let key = crate::search::target_key(&result.action);
+            self.history.remove(&key);
+            if let Err(err) = self.history.save(config::APP_NAME) {
+                eprintln!("issen: failed to save history.toml: {err}");
+            }
+        }
+        self.run_search();
+        cx.notify();
+    }
+
+    /// Toggles the query-history panel (🕘 icon).
+    fn toggle_history_panel(&mut self, cx: &mut Context<Self>) {
+        self.history_panel_open = !self.history_panel_open;
+        cx.notify();
+    }
+
+    /// Re-runs a past query picked from the history panel. Doesn't execute
+    /// anything directly — it's a "re-search," not a "re-run" (matches the
+    /// egui/eframe version's `show_history_panel`).
+    fn use_history_query(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(query) = self.history.queries.get(index).cloned() else {
+            return;
+        };
+        self.query = query.into();
+        let len = self.query.len();
+        self.selected_range = len..len;
+        self.marked_range = None;
+        self.history_panel_open = false;
+        self.run_search();
+        cx.notify();
+    }
+
     // --- Result-list keyboard actions ---
+    //
+    // While the query-history panel is open, `self.results` is stale (from
+    // the last real search), so every one of these guards on
+    // `history_panel_open` and no-ops instead of acting on it — matches the
+    // egui/eframe version's single early-return in `logic()`.
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_panel_open {
+            return;
+        }
         self.selected = self.selected.saturating_sub(1);
         cx.notify();
     }
 
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_panel_open {
+            return;
+        }
         if !self.results.is_empty() {
             self.selected = (self.selected + 1).min(self.results.len() - 1);
         }
@@ -537,6 +683,9 @@ impl IssenApp {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_panel_open {
+            return;
+        }
         self.run_result_action(ResultActionKind::Default, window, cx);
     }
 
@@ -546,6 +695,9 @@ impl IssenApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.history_panel_open {
+            return;
+        }
         self.run_result_action(ResultActionKind::RunAsAdmin, window, cx);
     }
 
@@ -555,14 +707,27 @@ impl IssenApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.history_panel_open {
+            return;
+        }
         self.run_result_action(ResultActionKind::OpenLocation, window, cx);
     }
 
+    /// Closes an open context menu first, if any (GPUI has no built-in
+    /// popup that would otherwise swallow this itself); only hides the
+    /// whole window on a second Escape.
     fn escape_action(&mut self, _: &EscapeAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
         self.hide(window, cx);
     }
 
     fn alt_digit(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_panel_open {
+            return;
+        }
         let visible_rows = self.results.len().min(self.visible_rows_cap());
         if idx < visible_rows {
             self.selected = idx;
@@ -810,6 +975,236 @@ impl IssenApp {
             .find_map(|(idx, _)| (idx > offset).then_some(idx))
             .unwrap_or(self.query.len())
     }
+
+    // --- Right-click context menu ---
+    //
+    // GPUI core has no `context_menu`-style widget, unlike egui — this is a
+    // custom overlay built from `anchored()` (keeps it inside the window
+    // bounds) wrapped in `deferred()` (paints after every sibling, i.e. on
+    // top). See `render_context_menu` for how it's actually drawn.
+
+    fn open_main_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(OpenContextMenu {
+            target: ContextMenuTarget::Main,
+            position: event.position,
+        });
+        cx.notify();
+    }
+
+    /// One row of a context menu (label + click handler). Visually distinct
+    /// from `toolbar_icon_button` (full-width row vs. a square icon) but the
+    /// same hover/cursor treatment.
+    fn context_menu_item(
+        key: &'static str,
+        label: &'static str,
+        on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(key)
+            .h(px(32.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .text_size(px(13.))
+            .text_color(white())
+            .cursor_pointer()
+            .hover(|d| d.bg(hsla(0., 0., 1., 0.08)))
+            .on_mouse_down(MouseButton::Left, on_click)
+            .child(label)
+    }
+
+    fn context_menu_separator() -> impl IntoElement {
+        div()
+            .h(px(1.))
+            .mx(px(6.))
+            .my(px(4.))
+            .bg(hsla(0., 0., 1., 0.12))
+    }
+
+    /// Builds the open context menu's overlay element, if any. Reads
+    /// `self.context_menu` (target + position) fresh each render, so a
+    /// `Row(i)` menu whose row disappeared (results changed while it was
+    /// open) is closed rather than shown against a stale index.
+    fn render_context_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.context_menu?;
+        let items: Vec<AnyElement> = match menu.target {
+            ContextMenuTarget::Main => vec![
+                Self::context_menu_item(
+                    "ctx-settings",
+                    self.strings.tray_settings,
+                    cx.listener(|this, _, _, cx| {
+                        this.context_menu = None;
+                        this.open_settings_window(cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+                Self::context_menu_item(
+                    "ctx-reindex",
+                    self.strings.tray_reindex,
+                    cx.listener(|this, _, _, cx| {
+                        this.context_menu = None;
+                        this.start_scan(cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+                Self::context_menu_separator().into_any_element(),
+                Self::context_menu_item("ctx-quit", self.strings.tray_quit, |_, _, _| {
+                    // See `tray.rs`'s `ensure_event_forwarding` doc comment
+                    // for why Quit exits directly rather than going through
+                    // any window-close path.
+                    std::process::exit(0);
+                })
+                .into_any_element(),
+            ],
+            ContextMenuTarget::Row(i) => {
+                let Some(result) = self.results.get(i) else {
+                    self.context_menu = None;
+                    return None;
+                };
+                let is_file_action = matches!(result.action, Action::Launch { .. });
+                let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
+
+                let mut items = vec![Self::context_menu_item(
+                    "ctx-run",
+                    self.strings.action_run,
+                    cx.listener(move |this, _, window, cx| {
+                        this.context_menu = None;
+                        this.selected = i;
+                        this.run_result_action(ResultActionKind::Default, window, cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()];
+                if is_file_action {
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-run-as-admin",
+                            self.strings.action_run_as_admin,
+                            cx.listener(move |this, _, window, cx| {
+                                this.context_menu = None;
+                                this.selected = i;
+                                this.run_result_action(ResultActionKind::RunAsAdmin, window, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-open-location",
+                            self.strings.action_open_location,
+                            cx.listener(move |this, _, window, cx| {
+                                this.context_menu = None;
+                                this.selected = i;
+                                this.run_result_action(ResultActionKind::OpenLocation, window, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-copy-path",
+                            self.strings.action_copy_path,
+                            cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                if let Some(SearchResult {
+                                    action: Action::Launch { path, .. },
+                                    ..
+                                }) = this.results.get(i)
+                                {
+                                    crate::launch::copy_to_clipboard(&path.display().to_string());
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                items.push(
+                    Self::context_menu_item(
+                        "ctx-register-alias",
+                        self.strings.action_register_alias,
+                        cx.listener(move |this, _, _, cx| {
+                            this.context_menu = None;
+                            this.selected = i;
+                            this.register_selected_as_alias(cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                );
+                if is_pinned {
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-unpin",
+                            self.strings.action_unpin,
+                            cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.selected = i;
+                                this.unpin_selected(cx);
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                } else {
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-pin",
+                            self.strings.action_pin,
+                            cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.selected = i;
+                                this.pin_selected(cx);
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                items
+            }
+        };
+
+        Some(
+            deferred(
+                anchored().position(menu.position).snap_to_window().child(
+                    div()
+                        .id("context-menu")
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .py(px(4.))
+                        .min_w(px(190.))
+                        .rounded(px(8.))
+                        .bg(hsla(220. / 360., 0.12, 0.13, 0.98))
+                        .border_1()
+                        .border_color(hsla(0., 0., 1., 0.14))
+                        .shadow_lg()
+                        // Capture-phase + `stop_propagation()` so an
+                        // outside click both closes the menu and doesn't
+                        // also fall through to whatever's underneath it
+                        // (e.g. launching a result row the click landed
+                        // on) — see `dispatch_mouse_event`'s capture/
+                        // bubble split in gpui's `window.rs`.
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.context_menu = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .children(items),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
+    }
 }
 
 impl EntityInputHandler for IssenApp {
@@ -868,6 +1263,11 @@ impl EntityInputHandler for IssenApp {
             (self.query[0..range.start].to_owned() + new_text + &self.query[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
         self.marked_range.take();
+        // Switch back to the normal search results, not the history panel,
+        // as soon as the query is edited (showing both at once would be
+        // confusing) — matches the egui/eframe version's `response.changed()`
+        // handling.
+        self.history_panel_open = false;
         // Every plain (non-IME) keystroke and every IME composition's final
         // commit go through this method (see `replace_and_mark_text_in_range`
         // for the in-progress-composition case), so this is the single place
@@ -903,6 +1303,7 @@ impl EntityInputHandler for IssenApp {
             .map(|new_range| new_range.start + range.start..new_range.end + range.end)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
 
+        self.history_panel_open = false;
         // Re-searching while composition is still in progress (not yet
         // committed) gives more responsive incremental results — the same
         // reasoning as searching on every keystroke of plain input.
@@ -1153,6 +1554,16 @@ impl Render for IssenApp {
             .h(px(MAIN_WINDOW_SIZE.1))
             .px(px(CONTENT_PADDING))
             .gap_2()
+            // Right-clicking anywhere in the input row (background, text
+            // field, or toolbar buttons — a button's own `Left`-only
+            // listener doesn't intercept `Right`) opens the Settings/
+            // Reindex/Quit menu, matching the egui/eframe version's shared
+            // `show_main_context_menu` (attached to both its drag
+            // background and the `TextEdit` response).
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::open_main_context_menu),
+            )
             .child(div().w(px(3.)).h(px(28.)).rounded(px(1.5)).bg(accent))
             .child(
                 div()
@@ -1180,73 +1591,127 @@ impl Render for IssenApp {
                 "toolbar-unit-converter",
                 "\u{1F4D0}",
                 cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::UnitConverter, cx)),
+            ))
+            .child(Self::toolbar_icon_button(
+                "toolbar-history",
+                "\u{1F558}",
+                cx.listener(|this, _, _, cx| this.toggle_history_panel(cx)),
             ));
 
-        let results: Vec<_> = self
-            .results
-            .iter()
-            .enumerate()
-            .map(|(i, result)| {
-                let is_selected = i == self.selected;
-                let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
-                let hint = if i == 0 {
-                    "\u{23ce}".to_string()
-                } else if i < visible_rows_cap {
-                    format!("Alt+{}", i + 1)
-                } else {
-                    String::new()
-                };
-                div()
-                    .id(("result-row", i))
+        let rows: Vec<AnyElement> = if self.history_panel_open {
+            if self.history.queries.is_empty() {
+                vec![div()
                     .flex()
                     .items_center()
                     .h(px(RESULT_ROW_HEIGHT))
                     .px(px(CONTENT_PADDING + 10.0))
-                    .gap_2()
-                    .when(is_selected, |d| d.bg(hsla(0., 0., 1., 0.09)))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _, window, cx| {
-                            this.selected = i;
-                            this.run_result_action(ResultActionKind::Default, window, cx);
-                        }),
-                    )
-                    .child(if is_pinned {
+                    .text_color(hsla(0., 0., 1., 0.5))
+                    .child(self.strings.history_empty)
+                    .into_any_element()]
+            } else {
+                self.history
+                    .queries
+                    .iter()
+                    .enumerate()
+                    .map(|(i, query)| {
                         div()
-                            .text_size(px(11.))
-                            .text_color(accent)
-                            .child("\u{1F4CC}")
-                    } else {
-                        div()
-                    })
-                    .child(
-                        div()
-                            .flex_1()
-                            .overflow_hidden()
+                            .id(("history-row", i))
                             .flex()
                             .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_color(if is_selected { accent } else { white() })
-                                    .child(result.title.clone()),
+                            .h(px(RESULT_ROW_HEIGHT))
+                            .px(px(CONTENT_PADDING + 10.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(hsla(0., 0., 1., 0.09)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.use_history_query(i, cx)),
                             )
-                            .child(
-                                div()
-                                    .text_color(hsla(0., 0., 1., 0.55))
-                                    .text_size(px(12.))
-                                    .child(result.subtitle.clone()),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.))
-                            .text_color(hsla(0., 0., 1., 0.5))
-                            .child(hint),
-                    )
-            })
-            .collect();
+                            .text_color(white())
+                            .child(query.clone())
+                            .into_any_element()
+                    })
+                    .collect()
+            }
+        } else {
+            self.results
+                .iter()
+                .enumerate()
+                .map(|(i, result)| {
+                    let is_selected = i == self.selected;
+                    let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
+                    let hint = if i == 0 {
+                        "\u{23ce}".to_string()
+                    } else if i < visible_rows_cap {
+                        format!("Alt+{}", i + 1)
+                    } else {
+                        String::new()
+                    };
+                    div()
+                        .id(("result-row", i))
+                        .flex()
+                        .items_center()
+                        .h(px(RESULT_ROW_HEIGHT))
+                        .px(px(CONTENT_PADDING + 10.0))
+                        .gap_2()
+                        .when(is_selected, |d| d.bg(hsla(0., 0., 1., 0.09)))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.selected = i;
+                                this.run_result_action(ResultActionKind::Default, window, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.selected = i;
+                                this.context_menu = Some(OpenContextMenu {
+                                    target: ContextMenuTarget::Row(i),
+                                    position: event.position,
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child(if is_pinned {
+                            div()
+                                .text_size(px(11.))
+                                .text_color(accent)
+                                .child("\u{1F4CC}")
+                        } else {
+                            div()
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_color(if is_selected { accent } else { white() })
+                                        .child(result.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(hsla(0., 0., 1., 0.55))
+                                        .text_size(px(12.))
+                                        .child(result.subtitle.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(hsla(0., 0., 1., 0.5))
+                                .child(hint),
+                        )
+                        .into_any_element()
+                })
+                .collect()
+        };
+
+        let context_menu_overlay = self.render_context_menu(cx);
 
         div()
             .key_context(KEY_CONTEXT)
@@ -1286,7 +1751,8 @@ impl Render for IssenApp {
             .border_1()
             .border_color(hsla(0., 0., 1., 0.14))
             .child(search_box)
-            .children(results)
+            .children(rows)
+            .children(context_menu_overlay)
     }
 }
 
