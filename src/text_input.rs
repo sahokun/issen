@@ -10,7 +10,7 @@
 use std::ops::Range;
 
 use gpui::{
-    div, fill, hsla, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Div,
+    div, fill, hsla, point, prelude::*, px, rems, size, App, Bounds, ClipboardItem, Context, Div,
     ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable,
     GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Stateful, Style, TextRun,
@@ -729,7 +729,7 @@ pub fn text_field(
         .border_color(border)
         .rounded(px(6.))
         .cursor(gpui::CursorStyle::IBeam)
-        .text_size(px(13.))
+        .text_size(rems(13. / 16.))
         .child(TextElement {
             input: input.clone(),
             text_color,

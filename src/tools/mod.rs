@@ -35,14 +35,14 @@ pub mod units;
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, hsla, linear_color_stop, linear_gradient, point, prelude::*, px, size, white, App,
-    AppContext, Bounds, Context, Entity, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Render,
-    SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    canvas, div, hsla, linear_color_stop, linear_gradient, point, prelude::*, px, rems, size,
+    white, App, AppContext, Bounds, Context, Entity, Hsla, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    Render, SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
     WindowKind, WindowOptions,
 };
 
-use crate::config::{AccentColor, Theme};
+use crate::config::{AccentColor, Theme, UiFont};
 use crate::i18n::Strings;
 use crate::text_input::{self, TextInput};
 use crate::ui_chrome::{self, GlassPalette};
@@ -66,11 +66,14 @@ const MIN_WINDOW_SIZE: (f32, f32) = (260.0, 300.0);
 /// replaces the content, not a second window).  Closing on a repeat click
 /// of the *same* tool is the caller's job (`IssenApp::toggle_tool`), since
 /// that's a decision about the toolbar button, not about opening a window.
+#[allow(clippy::too_many_arguments)]
 pub fn open(
     existing: &mut Option<WindowHandle<ToolsWindow>>,
     kind: ToolKind,
     strings: &'static Strings,
     theme: Theme,
+    ui_font: UiFont,
+    font_scale: f32,
     accent_color: AccentColor,
     cx: &mut App,
 ) {
@@ -113,7 +116,9 @@ pub fn open(
             },
             move |window, cx| {
                 ui_chrome::set_topmost(window);
-                cx.new(|cx| ToolsWindow::new(kind, strings, theme, accent_color, cx))
+                cx.new(|cx| {
+                    ToolsWindow::new(kind, strings, theme, ui_font, font_scale, accent_color, cx)
+                })
             },
         )
         .expect("failed to open tools window");
@@ -124,6 +129,8 @@ pub struct ToolsWindow {
     kind: ToolKind,
     strings: &'static Strings,
     theme: Theme,
+    ui_font: UiFont,
+    font_scale: f32,
     accent_color: AccentColor,
 
     // Color picker state. Hue/saturation/value are kept as their own
@@ -160,6 +167,8 @@ impl ToolsWindow {
         kind: ToolKind,
         strings: &'static Strings,
         theme: Theme,
+        ui_font: UiFont,
+        font_scale: f32,
         accent_color: AccentColor,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -190,6 +199,8 @@ impl ToolsWindow {
             kind,
             strings,
             theme,
+            ui_font,
+            font_scale,
             accent_color,
             hue,
             sat,
@@ -468,7 +479,7 @@ impl ToolsWindow {
             .size(px(28.))
             .rounded(px(6.))
             .cursor_pointer()
-            .text_size(px(14.))
+            .text_size(rems(14. / 16.))
             .hover(|d| d.bg(palette.control_bg))
             .on_mouse_down(MouseButton::Left, on_click)
             .child(glyph)
@@ -533,7 +544,7 @@ impl ToolsWindow {
             .when(self.picking_color, |d| {
                 d.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(rems(11. / 16.))
                         .text_color(palette.subtext)
                         .child(SharedString::from(strings.eyedropper_hint)),
                 )
@@ -546,13 +557,13 @@ impl ToolsWindow {
                     .child(
                         div()
                             .w(px(32.))
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(palette.subtext)
                             .child(SharedString::from(strings.label_rgb)),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(palette.text)
                             .child(format!("{r}, {g}, {b}")),
                     ),
@@ -565,13 +576,13 @@ impl ToolsWindow {
                     .child(
                         div()
                             .w(px(32.))
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(palette.subtext)
                             .child(SharedString::from(strings.label_hsl)),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(palette.text)
                             .child(format!("{hsl_h:.0}\u{b0}, {hsl_s:.0}%, {hsl_l:.0}%")),
                     ),
@@ -597,7 +608,7 @@ impl ToolsWindow {
             .justify_center()
             .rounded(px(6.))
             .cursor_pointer()
-            .text_size(px(12.))
+            .text_size(rems(12. / 16.))
             .text_color(if selected { accent } else { palette.subtext })
             .when(selected, |d| d.bg(palette.control_bg))
             .when(!selected, |d| {
@@ -609,7 +620,7 @@ impl ToolsWindow {
 
     fn chip_group_label(label: &'static str, palette: &GlassPalette) -> impl IntoElement {
         div()
-            .text_size(px(11.))
+            .text_size(rems(11. / 16.))
             .text_color(palette.subtext)
             .child(SharedString::from(label))
     }
@@ -731,7 +742,7 @@ impl ToolsWindow {
             )
             .child(
                 div()
-                    .text_size(px(18.))
+                    .text_size(rems(18. / 16.))
                     .text_color(accent)
                     .child(result_text.unwrap_or_default()),
             )
@@ -740,6 +751,7 @@ impl ToolsWindow {
 
 impl Render for ToolsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ui_chrome::apply_font_scale(window, self.font_scale);
         let dark = ui_chrome::resolve_dark(self.theme, window);
         let palette = ui_chrome::palette(dark);
         let accent = ui_chrome::accent_color(self.accent_color);
@@ -758,6 +770,7 @@ impl Render for ToolsWindow {
         };
 
         ui_chrome::glass_container(&palette)
+            .font_family(crate::fonts::ui_font_family(self.ui_font))
             .bg(ui_chrome::opaque_panel_bg(dark))
             .on_mouse_move(cx.listener(Self::on_root_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_mouse_up))

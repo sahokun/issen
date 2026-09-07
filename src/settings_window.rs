@@ -18,7 +18,7 @@
 use std::time::Instant;
 
 use gpui::{
-    div, point, prelude::*, px, size, App, AppContext, Bounds, Context, Div, Entity, Hsla,
+    div, point, prelude::*, px, rems, size, App, AppContext, Bounds, Context, Div, Entity, Hsla,
     InteractiveElement, MouseButton, ParentElement, ScrollHandle, SharedString, Styled, Window,
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
 };
@@ -45,6 +45,11 @@ enum SettingsTab {
 
 const WINDOW_SIZE: (f32, f32) = (640.0, 680.0);
 const MIN_WINDOW_SIZE: (f32, f32) = (480.0, 420.0);
+
+/// Same range the egui/eframe version's font-scale slider was clamped to —
+/// see `ui_chrome::apply_font_scale`'s doc comment for why it isn't wider.
+const FONT_SCALE_MIN: f32 = 0.9;
+const FONT_SCALE_MAX: f32 = 1.25;
 
 /// A plain-data snapshot of the `IssenApp` fields the settings window
 /// needs to render. Passed in at construction and refreshed afterward via
@@ -324,7 +329,7 @@ impl SettingsWindow {
                     .items_center()
                     .rounded(px(8.))
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(rems(13. / 16.))
                     .text_color(if selected { accent } else { palette.subtext })
                     .when(selected, |d| d.bg(palette.control_bg))
                     .on_mouse_down(
@@ -365,7 +370,7 @@ impl SettingsWindow {
                     .rounded(px(8.))
                     .cursor_pointer()
                     .bg(accent)
-                    .text_size(px(13.))
+                    .text_size(rems(13. / 16.))
                     .text_color(gpui::rgba(0x0A1002FFu32))
                     .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
                         if let Some(app_entity) = app.upgrade() {
@@ -388,7 +393,7 @@ impl SettingsWindow {
                     .justify_center()
                     .rounded(px(8.))
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(rems(13. / 16.))
                     .text_color(palette.text)
                     .hover(|d| d.bg(palette.control_bg))
                     .on_mouse_down(MouseButton::Left, |_, window, _cx| {
@@ -428,13 +433,13 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(px(11.))
+                    .text_size(rems(11. / 16.))
                     .text_color(gpui::rgba(0x0A1002FFu32))
                     .child(if checked { "\u{2713}" } else { "" }),
             )
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(rems(13. / 16.))
                     .text_color(palette.text)
                     .child(SharedString::from(label)),
             )
@@ -456,7 +461,7 @@ impl SettingsWindow {
             .justify_center()
             .rounded(px(6.))
             .cursor_pointer()
-            .text_size(px(12.))
+            .text_size(rems(12. / 16.))
             .text_color(if selected { accent } else { palette.subtext })
             .when(selected, |d| d.bg(palette.control_bg))
             .when(!selected, |d| {
@@ -479,7 +484,7 @@ impl SettingsWindow {
             .justify_between()
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(rems(13. / 16.))
                     .text_color(palette.text)
                     .child(SharedString::from(label)),
             )
@@ -492,7 +497,7 @@ impl SettingsWindow {
                     .child(
                         div()
                             .w(px(40.))
-                            .text_size(px(13.))
+                            .text_size(rems(13. / 16.))
                             .text_color(palette.text)
                             .child(SharedString::from(value_text)),
                     )
@@ -515,7 +520,7 @@ impl SettingsWindow {
             .border_1()
             .border_color(palette.control_border)
             .cursor_pointer()
-            .text_size(px(13.))
+            .text_size(rems(13. / 16.))
             .text_color(palette.text)
             .hover(|d| d.bg(palette.control_bg))
             .on_mouse_down(MouseButton::Left, move |_, _window, cx| on_click(cx))
@@ -524,14 +529,14 @@ impl SettingsWindow {
 
     fn row_label(label: &'static str, palette: &GlassPalette) -> impl IntoElement {
         div()
-            .text_size(px(13.))
+            .text_size(rems(13. / 16.))
             .text_color(palette.text)
             .child(SharedString::from(label))
     }
 
     fn section_heading(label: &'static str, palette: &GlassPalette) -> impl IntoElement {
         div()
-            .text_size(px(16.))
+            .text_size(rems(1.))
             .text_color(palette.text)
             .child(SharedString::from(label))
     }
@@ -552,14 +557,14 @@ impl SettingsWindow {
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(13.))
+                    .text_size(rems(13. / 16.))
                     .text_color(palette.text)
                     .child(primary),
             )
             .children(secondary.map(|s| {
                 div()
                     .flex_1()
-                    .text_size(px(12.))
+                    .text_size(rems(12. / 16.))
                     .text_color(palette.subtext)
                     .child(s)
             }))
@@ -573,7 +578,7 @@ impl SettingsWindow {
                     .justify_center()
                     .rounded(px(5.))
                     .cursor_pointer()
-                    .text_size(px(11.))
+                    .text_size(rems(11. / 16.))
                     .text_color(palette.subtext)
                     .hover(|d| d.bg(palette.control_bg).text_color(palette.text))
                     .on_mouse_down(MouseButton::Left, move |_, _window, cx| on_remove(cx))
@@ -877,13 +882,15 @@ impl SettingsWindow {
                     let app = app.clone();
                     move |cx| {
                         set_config(&app, cx, |c| {
-                            c.font_scale = ((c.font_scale - 0.05) * 100.).round() / 100.
+                            c.font_scale =
+                                (((c.font_scale - 0.05) * 100.).round() / 100.).max(FONT_SCALE_MIN)
                         })
                     }
                 },
                 move |cx| {
                     set_config(&app, cx, |c| {
-                        c.font_scale = ((c.font_scale + 0.05) * 100.).round() / 100.
+                        c.font_scale =
+                            (((c.font_scale + 0.05) * 100.).round() / 100.).min(FONT_SCALE_MAX)
                     })
                 },
             ))
@@ -943,7 +950,7 @@ impl SettingsWindow {
                             .rounded(px(6.))
                             .border_1()
                             .border_color(palette.control_border)
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(if self.pending_folder_pick {
                                 palette.subtext
                             } else {
@@ -1012,7 +1019,7 @@ impl SettingsWindow {
                                     .border_1()
                                     .border_color(palette.control_border)
                                     .cursor_pointer()
-                                    .text_size(px(12.))
+                                    .text_size(rems(12. / 16.))
                                     .text_color(palette.text)
                                     .hover(|d| d.bg(palette.control_bg))
                                     .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
@@ -1046,7 +1053,7 @@ impl SettingsWindow {
                             .rounded(px(6.))
                             .border_1()
                             .border_color(palette.control_border)
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(if scanning {
                                 palette.subtext
                             } else {
@@ -1065,14 +1072,19 @@ impl SettingsWindow {
                     })
                     .child(if scanning {
                         div()
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(palette.subtext)
                             .child(SharedString::from(strings.scanning))
                     } else if let Some(finished) = last_scan_finished {
                         let minutes = finished.elapsed().as_secs() / 60;
-                        div().text_size(px(12.)).text_color(palette.subtext).child(
-                            i18n::last_scan_text(i18n::lang_of(strings), minutes, last_scan_count),
-                        )
+                        div()
+                            .text_size(rems(12. / 16.))
+                            .text_color(palette.subtext)
+                            .child(i18n::last_scan_text(
+                                i18n::lang_of(strings),
+                                minutes,
+                                last_scan_count,
+                            ))
                     } else {
                         div()
                     }),
@@ -1166,7 +1178,7 @@ impl SettingsWindow {
                             .border_1()
                             .border_color(palette.control_border)
                             .cursor_pointer()
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(palette.text)
                             .hover(|d| d.bg(palette.control_bg))
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
@@ -1266,7 +1278,7 @@ impl SettingsWindow {
                             .border_1()
                             .border_color(palette.control_border)
                             .cursor_pointer()
-                            .text_size(px(12.))
+                            .text_size(rems(12. / 16.))
                             .text_color(palette.text)
                             .hover(|d| d.bg(palette.control_bg))
                             .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
@@ -1302,7 +1314,7 @@ impl SettingsWindow {
             .child(Self::section_heading(strings.section_everything, palette))
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(rems(12. / 16.))
                     .text_color(palette.subtext)
                     .child(SharedString::from(strings.everything_connected)),
             )
@@ -1338,7 +1350,7 @@ fn labeled_field(
         .gap_1()
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(rems(11. / 16.))
                 .text_color(palette.subtext)
                 .child(SharedString::from(label)),
         )
@@ -1362,6 +1374,7 @@ impl Render for SettingsWindow {
         let last_scan_finished = self.cached.last_scan_finished;
         let last_scan_count = self.cached.last_scan_count;
 
+        ui_chrome::apply_font_scale(window, config.font_scale);
         let dark = ui_chrome::resolve_dark(config.theme, window);
         let palette = ui_chrome::palette(dark);
         let accent = ui_chrome::accent_color(config.accent_color);
@@ -1396,6 +1409,7 @@ impl Render for SettingsWindow {
         };
 
         ui_chrome::glass_container(&palette)
+            .font_family(crate::fonts::ui_font_family(config.ui_font))
             .bg(ui_chrome::opaque_panel_bg(dark))
             .child(ui_chrome::title_bar(strings.settings_title, &palette))
             .child(

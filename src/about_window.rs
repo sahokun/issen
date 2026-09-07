@@ -5,12 +5,12 @@
 //! the same mechanism.
 
 use gpui::{
-    div, point, px, size, App, AppContext, Bounds, Context, IntoElement, ParentElement, Render,
-    SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    div, point, px, rems, size, App, AppContext, Bounds, Context, IntoElement, ParentElement,
+    Render, SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
     WindowKind, WindowOptions,
 };
 
-use crate::config::{self, Theme};
+use crate::config::{self, Theme, UiFont};
 use crate::i18n::{self, Strings};
 use crate::ui_chrome;
 
@@ -22,6 +22,8 @@ pub struct AboutWindow {
     /// re-read afterward — About is short-lived, and re-resolving on every
     /// repaint would mean re-reading `config.toml` from disk every frame.
     theme: Theme,
+    ui_font: UiFont,
+    font_scale: f32,
 }
 
 /// Opens the about window, or brings an already-open one to the front.
@@ -32,6 +34,8 @@ pub fn open(
     existing: &mut Option<WindowHandle<AboutWindow>>,
     strings: &'static Strings,
     theme: Theme,
+    ui_font: UiFont,
+    font_scale: f32,
     cx: &mut App,
 ) {
     if let Some(handle) = existing {
@@ -62,7 +66,12 @@ pub fn open(
             },
             move |window, cx| {
                 ui_chrome::set_topmost(window);
-                cx.new(|_cx| AboutWindow { strings, theme })
+                cx.new(|_cx| AboutWindow {
+                    strings,
+                    theme,
+                    ui_font,
+                    font_scale,
+                })
             },
         )
         .expect("failed to open about window");
@@ -71,6 +80,7 @@ pub fn open(
 
 impl Render for AboutWindow {
     fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        ui_chrome::apply_font_scale(window, self.font_scale);
         let dark = ui_chrome::resolve_dark(self.theme, window);
         let palette = ui_chrome::palette(dark);
 
@@ -78,6 +88,7 @@ impl Render for AboutWindow {
             i18n::about_version_text(i18n::lang_of(self.strings), env!("CARGO_PKG_VERSION"));
 
         ui_chrome::glass_container(&palette)
+            .font_family(crate::fonts::ui_font_family(self.ui_font))
             .child(ui_chrome::title_bar(self.strings.about_title, &palette))
             .child(
                 div()
@@ -89,13 +100,13 @@ impl Render for AboutWindow {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(18.))
+                            .text_size(rems(18. / 16.))
                             .text_color(palette.text)
                             .child(SharedString::from(config::APP_NAME)),
                     )
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(rems(13. / 16.))
                             .text_color(palette.subtext)
                             .child(SharedString::from(version)),
                     ),

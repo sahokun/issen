@@ -5,8 +5,8 @@
 //! window-lifecycle.md`), so every window paints its own.
 
 use gpui::{
-    div, hsla, px, rgba, Div, Hsla, InteractiveElement, MouseButton, ParentElement, SharedString,
-    Styled, Window, WindowAppearance, WindowControlArea,
+    div, hsla, px, rems, rgba, Div, Hsla, InteractiveElement, MouseButton, ParentElement,
+    SharedString, Styled, Window, WindowAppearance, WindowControlArea,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
@@ -51,6 +51,30 @@ pub fn set_topmost(window: &Window) {
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
+}
+
+/// GPUI's default `rem` size — every `.text_size(rems(n))` call in this app
+/// (converted from a literal `px` value by dividing by this) is sized
+/// relative to it. See [`apply_font_scale`].
+const BASE_REM_SIZE: f32 = 16.0;
+
+/// Applies `config.font_scale` to `window` by scaling its `rem` size —
+/// `Window::set_rem_size`'s own doc comment describes this as "just like
+/// zooming a web page". Every text size in the app is expressed via
+/// `.text_size(rems(n))` rather than a literal `px(n)` specifically so this
+/// one call scales all of them at once, without threading a scale factor
+/// through every widget helper individually. Layout metrics (paddings, row
+/// heights, window sizes) stay in literal `px` and don't scale — matching
+/// the egui/eframe version's `apply_font_scale`, which only ever rescaled
+/// `egui::Style::text_styles` for the same reason, and explains why its
+/// slider was clamped to a narrow 0.9-1.25 range: much further outside it
+/// and text starts to clip against those fixed-size rows.
+///
+/// Called at the top of every window's `render()` (not just once at
+/// creation) so a live change from the settings window's font-scale
+/// stepper is picked up on the next repaint of each open window.
+pub fn apply_font_scale(window: &mut Window, font_scale: f32) {
+    window.set_rem_size(px(BASE_REM_SIZE * font_scale.clamp(0.5, 2.0)));
 }
 
 /// Resolves `config.theme` to an actual dark/light bool: `Light`/`Dark` are
@@ -171,7 +195,7 @@ pub fn title_bar(title: impl Into<SharedString>, palette: &GlassPalette) -> Div 
         .window_control_area(WindowControlArea::Drag)
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(rems(11. / 16.))
                 .text_color(palette.subtext)
                 .child(title.into()),
         );
@@ -198,7 +222,7 @@ fn close_button(palette: &GlassPalette) -> Div {
         .justify_center()
         .size(px(26.))
         .rounded(px(4.))
-        .text_size(px(13.))
+        .text_size(rems(13. / 16.))
         .text_color(palette.subtext)
         .hover(|d| d.bg(hsla(0., 0., 1., 0.08)).text_color(palette.text))
         .on_mouse_down(MouseButton::Left, |_, window, _cx| {

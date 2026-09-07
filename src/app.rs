@@ -25,12 +25,12 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    actions, anchored, deferred, div, fill, hsla, point, prelude::*, px, size, white, AnyElement,
-    App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowKind,
+    actions, anchored, deferred, div, fill, hsla, point, prelude::*, px, rems, size, white,
+    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+    Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowKind,
     WindowOptions,
 };
 use gpui_platform::application;
@@ -596,7 +596,7 @@ impl IssenApp {
             .size(px(28.))
             .rounded(px(6.))
             .cursor_pointer()
-            .text_size(px(14.))
+            .text_size(rems(14. / 16.))
             .hover(|d| d.bg(hsla(0., 0., 1., 0.08)))
             // See the text field's own `.occlude()` comment in `render` —
             // without this, a click here would also count as landing on the
@@ -629,7 +629,14 @@ impl IssenApp {
                 // About that can fire while the main window is still hidden).
                 self.show(window, cx);
                 self.opening_secondary_window = true;
-                about_window::open(&mut self.about_window, self.strings, self.config.theme, cx);
+                about_window::open(
+                    &mut self.about_window,
+                    self.strings,
+                    self.config.theme,
+                    self.config.ui_font,
+                    self.config.font_scale,
+                    cx,
+                );
                 self.opening_secondary_window = false;
             }
         }
@@ -655,6 +662,8 @@ impl IssenApp {
             kind,
             self.strings,
             self.config.theme,
+            self.config.ui_font,
+            self.config.font_scale,
             self.config.accent_color,
             cx,
         );
@@ -1108,7 +1117,7 @@ impl IssenApp {
             .px(px(12.))
             .flex()
             .items_center()
-            .text_size(px(13.))
+            .text_size(rems(13. / 16.))
             .text_color(white())
             .cursor_pointer()
             .hover(|d| d.bg(hsla(0., 0., 1., 0.08)))
@@ -1640,6 +1649,7 @@ impl Element for TextElement {
 
 impl Render for IssenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ui_chrome::apply_font_scale(window, self.config.font_scale);
         self.sync_window_height(window);
 
         let accent = ui_chrome::accent_color(self.config.accent_color);
@@ -1705,7 +1715,7 @@ impl Render for IssenApp {
                             .occlude()
                             .cursor(CursorStyle::IBeam)
                             .text_color(white())
-                            .text_size(px(20.))
+                            .text_size(rems(20. / 16.))
                             .line_height(px(28.))
                             // `TextEdit`-equivalent drag normally means
                             // left-drag selects text, so the window can't be
@@ -1842,7 +1852,7 @@ impl Render for IssenApp {
                         )
                         .child(if is_pinned {
                             div()
-                                .text_size(px(11.))
+                                .text_size(rems(11. / 16.))
                                 .text_color(accent)
                                 .child("\u{1F4CC}")
                         } else {
@@ -1863,13 +1873,13 @@ impl Render for IssenApp {
                                 .child(
                                     div()
                                         .text_color(hsla(0., 0., 1., 0.55))
-                                        .text_size(px(12.))
+                                        .text_size(rems(12. / 16.))
                                         .child(result.subtitle.clone()),
                                 ),
                         )
                         .child(
                             div()
-                                .text_size(px(10.))
+                                .text_size(rems(10. / 16.))
                                 .text_color(hsla(0., 0., 1., 0.5))
                                 .child(hint),
                         )
@@ -1913,6 +1923,7 @@ impl Render for IssenApp {
             .size_full()
             .flex()
             .flex_col()
+            .font_family(crate::fonts::ui_font_family(self.config.ui_font))
             .bg(glass_bg)
             .rounded(px(0.))
             .border_1()

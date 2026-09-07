@@ -10,6 +10,7 @@ mod about_window;
 mod app;
 mod config;
 mod display;
+mod fonts;
 mod history;
 mod hotkey;
 mod i18n;
@@ -21,10 +22,6 @@ mod text_input;
 mod tools;
 mod tray;
 mod ui_chrome;
-// GPUI移行(egui/eframe→GPUI)のPhase 1着手に伴い、egui依存のこれは一時的に
-// コンパイル対象から外している。GPUI版に書き直して順次復活させる予定
-// (詳細はapp.rsのモジュールdocコメント参照)。ファイル自体は削除していない。
-// mod fonts;
 
 fn main() {
     if single_instance::is_already_running() {
