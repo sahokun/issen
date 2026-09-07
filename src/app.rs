@@ -30,7 +30,8 @@ use gpui::{
     Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowKind,
+    WindowOptions,
 };
 use gpui_platform::application;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -157,6 +158,25 @@ pub struct IssenApp {
     content_height: f32,
 
     visible: bool,
+    /// Set `false` on every `show()`, `true` the first time this window is
+    /// actually observed OS-active afterward. Guards the focus-loss auto-hide
+    /// (`new`'s `observe_window_activation`) against a real race: `show()`
+    /// requests OS activation asynchronously (`Window::activate_window`,
+    /// dispatched via an executor task), so if Windows denies the foreground
+    /// steal, a deactivation could arrive while `visible` is already `true`
+    /// but this window was never actually the active one — without this
+    /// guard, that would immediately hide the window it just showed.
+    seen_active_since_show: bool,
+    /// Set for the duration of a synchronous call into `settings_window::
+    /// open`/`tools::open`/`about_window::open`. Those functions' `Option<
+    /// WindowHandle<_>>` output field is only assigned *after* `cx.
+    /// open_window` returns, but per gotcha #3 in the migration notes,
+    /// `cx.open_window` runs the new window's first render (and can trigger
+    /// this window's deactivation) synchronously, inside that same call —
+    /// during which `has_open_secondary_window`'s entity-based check would
+    /// still see `None` and hide this window out from under the one that's
+    /// opening. This flag covers exactly that window.
+    opening_secondary_window: bool,
 
     /// The query-history list (🕘 icon next to the input box). While open,
     /// it's drawn in place of the normal result list, and keyboard shortcuts
@@ -231,6 +251,8 @@ impl IssenApp {
             selected: 0,
             content_height: MAIN_WINDOW_SIZE.1,
             visible: false,
+            seen_active_since_show: false,
+            opening_secondary_window: false,
             history_panel_open: false,
             context_menu: None,
             hotkey,
@@ -249,7 +271,44 @@ impl IssenApp {
             config,
         };
         app.start_scan(cx);
+
+        // Matches the egui/eframe version's `WindowFocused(false)` handling:
+        // losing OS focus hides the window, unless a secondary window (about/
+        // settings/tools) is why focus moved — those are opened *over* the
+        // main window and shouldn't cause it to vanish out from under them.
+        // `cx.observe_window_activation` fires on both activate and
+        // deactivate, so the `is_window_active()` check picks out the
+        // deactivate case; `.detach()` keeps the subscription alive for the
+        // window's lifetime (see `settings_window.rs` for the same pattern).
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.seen_active_since_show = true;
+                return;
+            }
+            if this.seen_active_since_show && !this.has_open_secondary_window(cx) {
+                this.hide(window, cx);
+            }
+        })
+        .detach();
+
         app
+    }
+
+    /// Whether the about/settings/tools window is currently open (or in the
+    /// middle of opening — see `opening_secondary_window`'s doc comment).
+    /// Those `Option<WindowHandle<_>>` fields are never cleared back to
+    /// `None` when the user closes the window via its own close button (only
+    /// when this app itself replaces/reopens it), so `.is_some()` alone would
+    /// still see a stale, already-closed handle as "open" — `entity(cx)`
+    /// fails once the underlying OS window is actually gone.
+    fn has_open_secondary_window(&self, cx: &Context<Self>) -> bool {
+        fn is_open<V: Render>(handle: &Option<WindowHandle<V>>, cx: &Context<IssenApp>) -> bool {
+            handle.as_ref().is_some_and(|h| h.entity(cx).is_ok())
+        }
+        self.opening_secondary_window
+            || is_open(&self.about_window, cx)
+            || is_open(&self.settings_window, cx)
+            || is_open(&self.tools_window, cx)
     }
 
     fn run_search(&mut self) {
@@ -421,8 +480,17 @@ impl IssenApp {
             return;
         }
         self.visible = true;
+        self.seen_active_since_show = false;
         let target = self.resolve_show_target();
         move_window(self.main_hwnd, target.0 as i32, target.1 as i32);
+        // `window.focus` only moves GPUI's own internal notion of which view
+        // has keyboard focus — it doesn't ask Windows for OS-level input
+        // focus. Without `activate_window()` (raw `SetForegroundWindow`/
+        // `SetActiveWindow`/`SetFocus`, see `gpui_windows`'s `activate`),
+        // keystrokes typed right after a hotkey press went nowhere until the
+        // user clicked the window once. Matches the egui/eframe version's
+        // `ViewportCommand::Focus` on the same call site.
+        window.activate_window();
         window.focus(&self.focus_handle, cx);
         cx.notify();
     }
@@ -518,6 +586,10 @@ impl IssenApp {
             .cursor_pointer()
             .text_size(px(14.))
             .hover(|d| d.bg(hsla(0., 0., 1., 0.08)))
+            // See the text field's own `.occlude()` comment in `render` —
+            // without this, a click here would also count as landing on the
+            // search box's background drag region behind it.
+            .occlude()
             .on_mouse_down(MouseButton::Left, on_click)
             .child(glyph)
     }
@@ -544,7 +616,9 @@ impl IssenApp {
                 // brings the main search window up (it's the only route to
                 // About that can fire while the main window is still hidden).
                 self.show(window, cx);
+                self.opening_secondary_window = true;
                 about_window::open(&mut self.about_window, self.strings, self.config.theme, cx);
+                self.opening_secondary_window = false;
             }
         }
     }
@@ -563,6 +637,7 @@ impl IssenApp {
                 return;
             }
         }
+        self.opening_secondary_window = true;
         tools::open(
             &mut self.tools_window,
             kind,
@@ -571,6 +646,7 @@ impl IssenApp {
             self.config.accent_color,
             cx,
         );
+        self.opening_secondary_window = false;
     }
 
     /// Opens the settings window (or brings an already-open one to front),
@@ -586,7 +662,9 @@ impl IssenApp {
             last_scan_finished: self.last_scan_finished,
             last_scan_count: self.last_scan_count,
         };
+        self.opening_secondary_window = true;
         crate::settings_window::open(&mut self.settings_window, weak, snapshot, cx);
+        self.opening_secondary_window = false;
     }
 
     /// "Register as alias" from a result row's context menu: opens the
@@ -993,6 +1071,14 @@ impl IssenApp {
             target: ContextMenuTarget::Main,
             position: event.position,
         });
+        // A right-click landing on the search box's drag region (see
+        // `render`'s `search_box`) reaches this handler via Windows'
+        // `WM_NCRBUTTONDOWN` path (`window_control_area`'s hit-test), not
+        // the normal client-area `WM_RBUTTONDOWN`. Without stopping
+        // propagation here, that NC message is left unhandled and falls
+        // through to `DefWindowProc`, which pops the native OS system menu
+        // on top of this custom one.
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -1549,11 +1635,9 @@ impl Render for IssenApp {
         let visible_rows_cap = self.visible_rows_cap();
 
         let search_box = div()
-            .flex()
-            .items_center()
+            .flex_none()
+            .w_full()
             .h(px(MAIN_WINDOW_SIZE.1))
-            .px(px(CONTENT_PADDING))
-            .gap_2()
             // Right-clicking anywhere in the input row (background, text
             // field, or toolbar buttons — a button's own `Left`-only
             // listener doesn't intercept `Right`) opens the Settings/
@@ -1564,43 +1648,96 @@ impl Render for IssenApp {
                 MouseButton::Right,
                 cx.listener(Self::open_main_context_menu),
             )
-            .child(div().w(px(3.)).h(px(28.)).rounded(px(1.5)).bg(accent))
+            .child(
+                // With `with_decorations(false)` there's no OS title bar to
+                // drag, so the input row doubles as one — an
+                // absolutely-positioned, full-row background marked as a
+                // `WindowControlArea::Drag` hit-test region. A sibling of the
+                // padded content row below (not its parent, and not padded
+                // itself), so `inset_0` spans the row's true full width
+                // rather than just its content box; painted first so the
+                // accent bar/text field/toolbar buttons (painted after, thus
+                // on top) still claim their own clicks — this only ends up
+                // "hit" in the gaps between them. Matches the egui/eframe
+                // version's `drag_rect`/`drag-bg`, sized to just this row so
+                // it can't compete with clicking a result row below.
+                div()
+                    .absolute()
+                    .inset_0()
+                    .window_control_area(WindowControlArea::Drag),
+            )
             .child(
                 div()
-                    .flex_1()
-                    .cursor(CursorStyle::IBeam)
-                    .text_color(white())
-                    .text_size(px(20.))
-                    .line_height(px(28.))
-                    // Mouse handlers for text selection are scoped to just this
-                    // div (not the top-level container below) so clicking a
-                    // result row doesn't also register as a text-selection
-                    // mouse-down on the search box.
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                    .on_mouse_move(cx.listener(Self::on_mouse_move))
-                    .child(TextElement { input: cx.entity() }),
-            )
-            .child(Self::toolbar_icon_button(
-                "toolbar-color-picker",
-                "\u{1F3A8}",
-                cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::ColorPicker, cx)),
-            ))
-            .child(Self::toolbar_icon_button(
-                "toolbar-unit-converter",
-                "\u{1F4D0}",
-                cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::UnitConverter, cx)),
-            ))
-            .child(Self::toolbar_icon_button(
-                "toolbar-history",
-                "\u{1F558}",
-                cx.listener(|this, _, _, cx| this.toggle_history_panel(cx)),
-            ));
+                    .flex()
+                    .items_center()
+                    .size_full()
+                    .px(px(CONTENT_PADDING))
+                    .gap_2()
+                    .child(div().w(px(3.)).h(px(28.)).rounded(px(1.5)).bg(accent))
+                    .child(
+                        div()
+                            .flex_1()
+                            // GPUI's hit-test walks every overlapping hitbox
+                            // front-to-back and only stops at one marked
+                            // `BlockMouse` (`Window::hit_test`) — without
+                            // `.occlude()` here, a click anywhere on this
+                            // div would *also* still count as landing on the
+                            // background drag-bg behind it (same rect,
+                            // unconditionally marked `WindowControlArea::
+                            // Drag`), so typed-text drag-to-select would
+                            // double as a window-drag on every click.
+                            // `.occlude()` stops the hit-test from reaching
+                            // that far, leaving only this div's own
+                            // (conditional) drag registration in play.
+                            .occlude()
+                            .cursor(CursorStyle::IBeam)
+                            .text_color(white())
+                            .text_size(px(20.))
+                            .line_height(px(28.))
+                            // `TextEdit`-equivalent drag normally means
+                            // left-drag selects text, so the window can't be
+                            // dragged from on top of it. When the query is
+                            // empty there's no selectable text, so this div
+                            // doubles as a drag region too (matches the
+                            // egui/eframe version's `response.
+                            // drag_started_by` repurposing) — while typed
+                            // text exists, only the background above still
+                            // drags.
+                            .when(self.query.is_empty(), |d| {
+                                d.window_control_area(WindowControlArea::Drag)
+                            })
+                            // Mouse handlers for text selection are scoped to
+                            // just this div (not the top-level container
+                            // below) so clicking a result row doesn't also
+                            // register as a text-selection mouse-down on the
+                            // search box.
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                            .on_mouse_move(cx.listener(Self::on_mouse_move))
+                            .child(TextElement { input: cx.entity() }),
+                    )
+                    .child(Self::toolbar_icon_button(
+                        "toolbar-color-picker",
+                        "\u{1F3A8}",
+                        cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::ColorPicker, cx)),
+                    ))
+                    .child(Self::toolbar_icon_button(
+                        "toolbar-unit-converter",
+                        "\u{1F4D0}",
+                        cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::UnitConverter, cx)),
+                    ))
+                    .child(Self::toolbar_icon_button(
+                        "toolbar-history",
+                        "\u{1F558}",
+                        cx.listener(|this, _, _, cx| this.toggle_history_panel(cx)),
+                    )),
+            );
 
         let rows: Vec<AnyElement> = if self.history_panel_open {
             if self.history.queries.is_empty() {
                 vec![div()
+                    .flex_none()
                     .flex()
                     .items_center()
                     .h(px(RESULT_ROW_HEIGHT))
@@ -1613,9 +1750,17 @@ impl Render for IssenApp {
                     .queries
                     .iter()
                     .enumerate()
+                    // `sync_window_height` sizes the window for at most
+                    // `visible_rows_cap` history rows — without this cap,
+                    // GPUI's default `flex-shrink: 1` on `flex_col` children
+                    // compresses every row to fit whatever's actually
+                    // rendered, making row height (and thus the whole list)
+                    // visibly wobble as the history count crosses that cap.
+                    .take(visible_rows_cap)
                     .map(|(i, query)| {
                         div()
                             .id(("history-row", i))
+                            .flex_none()
                             .flex()
                             .items_center()
                             .h(px(RESULT_ROW_HEIGHT))
@@ -1636,6 +1781,14 @@ impl Render for IssenApp {
             self.results
                 .iter()
                 .enumerate()
+                // See the history-row `.take` above — `sync_window_height`
+                // sizes the window for at most `visible_rows_cap` rows, so
+                // rendering more than that would let `flex_col`'s default
+                // shrink behavior compress every row to fit, bobbing the
+                // whole list (and the search box above it, per `flex_none`
+                // there) up and down on every keystroke as the result count
+                // changes.
+                .take(visible_rows_cap)
                 .map(|(i, result)| {
                     let is_selected = i == self.selected;
                     let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
@@ -1648,6 +1801,7 @@ impl Render for IssenApp {
                     };
                     div()
                         .id(("result-row", i))
+                        .flex_none()
                         .flex()
                         .items_center()
                         .h(px(RESULT_ROW_HEIGHT))
@@ -1846,7 +2000,13 @@ pub fn run(config: Config) {
                     focus: true,
                     show: true,
                     kind: WindowKind::PopUp,
-                    is_movable: false,
+                    // `true` so the search box's own drag region
+                    // (`WindowControlArea::Drag`, see `render`'s
+                    // `search_box`) can actually move the window — on
+                    // Windows, `is_movable: false` disables the OS-level
+                    // `HTCAPTION` hit-test regardless of what the app marks
+                    // as a drag area (`gpui_windows`'s `handle_hit_test_msg`).
+                    is_movable: true,
                     window_background: WindowBackgroundAppearance::Transparent,
                     ..Default::default()
                 },
@@ -1893,6 +2053,15 @@ pub fn run(config: Config) {
                 }
             })
             .detach();
+        }
+
+        // Shows the main window at startup via the real `show()` path (OS
+        // activation, `visible = true`, the focus-loss observer's guard
+        // reset — everything a real hotkey press does), for verifying
+        // show()-dependent behavior (focus-on-show, focus-loss auto-hide,
+        // drag) without needing to synthesize the actual global hotkey.
+        if std::env::var_os("ISSEN_DEBUG_SHOW").is_some() {
+            let _ = window_handle.update(cx, |view, window, cx| view.show(window, cx));
         }
 
         // Opens the about window at startup, via the same tray-action path a

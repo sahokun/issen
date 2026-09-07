@@ -6,7 +6,7 @@
 
 use gpui::{
     div, hsla, px, rgba, Div, Hsla, InteractiveElement, MouseButton, ParentElement, SharedString,
-    Styled, Window, WindowAppearance,
+    Styled, Window, WindowAppearance, WindowControlArea,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
@@ -118,6 +118,21 @@ pub fn palette(dark: bool) -> GlassPalette {
     }
 }
 
+/// A fully opaque variant of [`palette`]'s `panel_bg` (same hue, alpha
+/// forced to 255). For a window that wants the glass chrome's colors but
+/// not the see-through background — currently only the settings window
+/// (`settings_window.rs`), whose users found the default translucency too
+/// faint to read text against a busy desktop behind it. `palette()` itself
+/// stays untouched so about/tools (which didn't ask for this) aren't
+/// affected.
+pub fn opaque_panel_bg(dark: bool) -> Hsla {
+    if dark {
+        rgba(0x12141AFFu32).into()
+    } else {
+        rgba(0xFAFAFCFFu32).into()
+    }
+}
+
 /// A window-filling container already styled with the glass panel
 /// background and border. Callers stack their content into it.
 pub fn glass_container(palette: &GlassPalette) -> Div {
@@ -147,9 +162,14 @@ pub fn title_bar(title: impl Into<SharedString>, palette: &GlassPalette) -> Div 
         .h_full()
         .flex()
         .items_center()
-        .on_mouse_down(MouseButton::Left, |_, window, _cx| {
-            window.start_window_move();
-        })
+        // `Window::start_window_move` is a no-op on Windows (its own doc
+        // comment says "for Linux and macOS") — real Windows window-drag
+        // goes through the `WM_NCHITTEST` hit-test system, wired up
+        // automatically by GPUI for any element marked as a
+        // `WindowControlArea::Drag` region (see `app.rs`'s main search box
+        // for the same mechanism). `is_movable: true` must also be set on
+        // the window (`WindowOptions`) or Windows ignores this entirely.
+        .window_control_area(WindowControlArea::Drag)
         .child(
             div()
                 .text_size(px(11.))

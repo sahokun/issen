@@ -126,7 +126,11 @@ pub fn open(
                 is_movable: true,
                 is_resizable: true,
                 window_min_size: Some(size(px(MIN_WINDOW_SIZE.0), px(MIN_WINDOW_SIZE.1))),
-                window_background: WindowBackgroundAppearance::Transparent,
+                // Unlike about/tools, the settings window's default
+                // translucent glass background was reported too faint to
+                // read against a busy desktop — `opaque_panel_bg` (below)
+                // pairs a fully opaque fill with this.
+                window_background: WindowBackgroundAppearance::Opaque,
                 ..Default::default()
             },
             move |window, cx| {
@@ -1392,6 +1396,7 @@ impl Render for SettingsWindow {
         };
 
         ui_chrome::glass_container(&palette)
+            .bg(ui_chrome::opaque_panel_bg(dark))
             .child(ui_chrome::title_bar(strings.settings_title, &palette))
             .child(
                 div()
