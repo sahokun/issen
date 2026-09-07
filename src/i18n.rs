@@ -131,6 +131,9 @@ pub struct Strings {
     pub label_rgb: &'static str,
     pub label_hsl: &'static str,
 
+    pub label_unit_category: &'static str,
+    pub label_unit_from: &'static str,
+    pub label_unit_to: &'static str,
     pub unit_length: &'static str,
     pub unit_mass: &'static str,
     pub unit_temperature: &'static str,
@@ -235,6 +238,9 @@ const EN: Strings = Strings {
     label_rgb: "RGB",
     label_hsl: "HSL",
 
+    label_unit_category: "Category",
+    label_unit_from: "From",
+    label_unit_to: "To",
     unit_length: "Length",
     unit_mass: "Mass",
     unit_temperature: "Temperature",
@@ -338,6 +344,9 @@ const JA: Strings = Strings {
     label_rgb: "RGB",
     label_hsl: "HSL",
 
+    label_unit_category: "カテゴリ",
+    label_unit_from: "変換元",
+    label_unit_to: "変換先",
     unit_length: "長さ",
     unit_mass: "質量",
     unit_temperature: "温度",

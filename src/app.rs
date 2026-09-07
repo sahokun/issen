@@ -10,12 +10,12 @@
 //!     使わず、ホットキー/トレイイベントは`futures::channel::mpsc`と
 //!     `App::spawn`によるイベント駆動の待受けにしている
 //!     (`hotkey.rs`/`tray.rs`のAPIもこの前提でegui非依存に書き換え済み)。
-//!   - about/settingsウィンドウ(`about_window.rs`/`settings_window.rs`)を
-//!     移植済み。設定のテキスト入力欄は`text_input.rs`の汎用`TextInput`
-//!     エンティティを再利用している。toolsウィンドウ、右クリックコンテキスト
-//!     メニュー、クエリ履歴パネル、起動時の合成フリッカー対策(layered prime)、
-//!     show/hideのフェードインアニメーションは未移植(Phase 1の後続ステップで
-//!     追加予定)。
+//!   - about/settings/toolsウィンドウ(`about_window.rs`/`settings_window.rs`/
+//!     `tools/mod.rs`)を移植済み。設定・toolsのテキスト入力欄は
+//!     `text_input.rs`の汎用`TextInput`エンティティを再利用している。
+//!     右クリックコンテキストメニュー、クエリ履歴パネル、起動時の合成
+//!     フリッカー対策(layered prime)、show/hideのフェードインアニメーションは
+//!     未移植(Phase 1の後続ステップで追加予定)。
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -48,6 +48,7 @@ use crate::search::everything::EverythingProvider;
 use crate::search::plugin::PluginProvider;
 use crate::search::windows_settings::WindowsSettingsProvider;
 use crate::search::{Action, SearchProvider, SearchResult};
+use crate::tools::{self, ToolKind, ToolsWindow};
 use crate::tray::{self, TrayAction, TrayHandle};
 use crate::ui_chrome;
 
@@ -134,6 +135,7 @@ pub struct IssenApp {
     pub(crate) tray: TrayHandle,
     about_window: Option<WindowHandle<AboutWindow>>,
     settings_window: Option<WindowHandle<crate::settings_window::SettingsWindow>>,
+    tools_window: Option<WindowHandle<ToolsWindow>>,
     app_index: AppIndexProvider,
     history: crate::history::History,
     plugins: PluginProvider,
@@ -193,6 +195,7 @@ impl IssenApp {
             tray,
             about_window: None,
             settings_window: None,
+            tools_window: None,
             app_index: AppIndexProvider::empty(),
             history: crate::history::History::load_or_default(config::APP_NAME),
             plugins: PluginProvider::load_from_app_data(),
@@ -438,6 +441,28 @@ impl IssenApp {
         (self.config.max_results as usize).min(MAX_VISIBLE_ROWS)
     }
 
+    /// One of the search box's toolbar icon buttons (color picker, unit
+    /// converter — see `crate::tools`).
+    fn toolbar_icon_button(
+        key: &'static str,
+        glyph: &'static str,
+        on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(key)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(28.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_size(px(14.))
+            .hover(|d| d.bg(hsla(0., 0., 1., 0.08)))
+            .on_mouse_down(MouseButton::Left, on_click)
+            .child(glyph)
+    }
+
     fn handle_tray_action(
         &mut self,
         action: TrayAction,
@@ -471,6 +496,30 @@ impl IssenApp {
                 about_window::open(&mut self.about_window, self.strings, self.config.theme, cx);
             }
         }
+    }
+
+    /// Toggles a toolbar tool open/closed: a repeat click on the button for
+    /// the tool that's currently showing closes the window (matches the
+    /// egui/eframe version, where both tools shared one viewport); clicking
+    /// while the *other* tool is open switches its content in place instead
+    /// of opening a second window.
+    fn toggle_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.tools_window {
+            let current_kind = handle.update(cx, |view, _, _| view.kind()).ok();
+            if current_kind == Some(kind) {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+                self.tools_window = None;
+                return;
+            }
+        }
+        tools::open(
+            &mut self.tools_window,
+            kind,
+            self.strings,
+            self.config.theme,
+            self.config.accent_color,
+            cx,
+        );
     }
 
     // --- Result-list keyboard actions ---
@@ -1121,7 +1170,17 @@ impl Render for IssenApp {
                     .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     .child(TextElement { input: cx.entity() }),
-            );
+            )
+            .child(Self::toolbar_icon_button(
+                "toolbar-color-picker",
+                "\u{1F3A8}",
+                cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::ColorPicker, cx)),
+            ))
+            .child(Self::toolbar_icon_button(
+                "toolbar-unit-converter",
+                "\u{1F4D0}",
+                cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::UnitConverter, cx)),
+            ));
 
         let results: Vec<_> = self
             .results
@@ -1381,6 +1440,20 @@ pub fn run(config: Config) {
         if std::env::var_os("ISSEN_DEBUG_OPEN_SETTINGS").is_some() {
             let _ = window_handle.update(cx, |view, window, cx| {
                 view.handle_tray_action(TrayAction::Settings, window, cx)
+            });
+        }
+        // Tools has no tray menu entry (only reachable via the search box's
+        // toolbar buttons in normal use), so this is the only way to open
+        // it for verification without driving mouse input.
+        let debug_tool = match std::env::var("ISSEN_DEBUG_OPEN_TOOL").as_deref() {
+            Ok("color-picker") => Some(ToolKind::ColorPicker),
+            Ok("unit-converter") => Some(ToolKind::UnitConverter),
+            _ => None,
+        };
+        if let Some(kind) = debug_tool {
+            let _ = window_handle.update(cx, |view, window, cx| {
+                view.show(window, cx);
+                view.toggle_tool(kind, cx);
             });
         }
 

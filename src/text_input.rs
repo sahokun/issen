@@ -101,6 +101,22 @@ impl TextInput {
         cx.notify();
     }
 
+    /// Same as `set_text`, but doesn't `cx.notify()` — the caller's own
+    /// `cx.notify()` (on a different entity) already covers this field's
+    /// repaint, since `text_field()`'s `TextElement` reads content fresh
+    /// each paint rather than caching it. Used for one-way display-only
+    /// sync where re-firing this field's own `cx.observe` would be wrong:
+    /// the tools window's color picker writes the derived hex string here
+    /// after a wheel/eyedropper edit, and must not have that write bounce
+    /// back through the hex field's change-observer (which would overwrite
+    /// the hue/saturation the wheel just set, including snapping hue to 0
+    /// whenever the drag passes through a fully desaturated color).
+    pub fn set_text_silent(&mut self, text: impl Into<SharedString>) {
+        self.content = text.into();
+        self.selected_range = self.content.len()..self.content.len();
+        self.marked_range = None;
+    }
+
     fn cursor_offset(&self) -> usize {
         if self.selection_reversed {
             self.selected_range.start
