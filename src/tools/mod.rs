@@ -106,7 +106,9 @@ pub fn open(
                 is_movable: true,
                 is_resizable: true,
                 window_min_size: Some(size(px(MIN_WINDOW_SIZE.0), px(MIN_WINDOW_SIZE.1))),
-                window_background: WindowBackgroundAppearance::Transparent,
+                // 設定画面と同様、半透明背景は背景コンテンツに埋もれて
+                // 読みづらいとの指摘を受け不透明化(about共有パレットは変更なし)
+                window_background: WindowBackgroundAppearance::Opaque,
                 ..Default::default()
             },
             move |window, cx| {
@@ -756,6 +758,7 @@ impl Render for ToolsWindow {
         };
 
         ui_chrome::glass_container(&palette)
+            .bg(ui_chrome::opaque_panel_bg(dark))
             .on_mouse_move(cx.listener(Self::on_root_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_root_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_root_mouse_up))

@@ -120,11 +120,10 @@ pub fn palette(dark: bool) -> GlassPalette {
 
 /// A fully opaque variant of [`palette`]'s `panel_bg` (same hue, alpha
 /// forced to 255). For a window that wants the glass chrome's colors but
-/// not the see-through background — currently only the settings window
-/// (`settings_window.rs`), whose users found the default translucency too
+/// not the see-through background — settings (`settings_window.rs`) and
+/// tools (`tools/mod.rs`), whose users found the default translucency too
 /// faint to read text against a busy desktop behind it. `palette()` itself
-/// stays untouched so about/tools (which didn't ask for this) aren't
-/// affected.
+/// stays untouched so about (which didn't ask for this) isn't affected.
 pub fn opaque_panel_bg(dark: bool) -> Hsla {
     if dark {
         rgba(0x12141AFFu32).into()
