@@ -37,6 +37,7 @@ use gpui_platform::application;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use unicode_segmentation::UnicodeSegmentation;
 use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
     SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_TOOLWINDOW,
@@ -281,11 +282,30 @@ impl IssenApp {
         // deactivate case; `.detach()` keeps the subscription alive for the
         // window's lifetime (see `settings_window.rs` for the same pattern).
         cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
+            let active = window.is_window_active();
+            let had_seen = this.seen_active_since_show;
+            if active {
                 this.seen_active_since_show = true;
+                focus_trace(format_args!(
+                    "observer: active=true had_seen={had_seen} -> seen=true"
+                ));
                 return;
             }
-            if this.seen_active_since_show && !this.has_open_secondary_window(cx) {
+            let has_secondary = this.has_open_secondary_window(cx);
+            let will_hide = had_seen && !has_secondary;
+            focus_trace(format_args!(
+                "observer: active=false had_seen={had_seen} has_secondary={has_secondary} fg={} thread_active={} -> {}",
+                window_is_foreground(this.main_hwnd),
+                window_is_thread_active(this.main_hwnd),
+                if will_hide {
+                    "hide"
+                } else if !had_seen {
+                    "skip(not-seen)"
+                } else {
+                    "skip(secondary-open)"
+                }
+            ));
+            if will_hide {
                 this.hide(window, cx);
             }
         })
@@ -493,8 +513,19 @@ impl IssenApp {
         // ever setting it from an activation event that, in this specific
         // case, will never arrive.
         self.seen_active_since_show = window_is_foreground(self.main_hwnd);
+        focus_trace(format_args!(
+            "show: fg={} thread_active={} -> seed_seen_active={}",
+            self.seen_active_since_show,
+            window_is_thread_active(self.main_hwnd),
+            self.seen_active_since_show
+        ));
         let target = self.resolve_show_target();
         move_window(self.main_hwnd, target.0 as i32, target.1 as i32);
+        // `hide()` skips this on its own way out (see `sync_window_height`'s
+        // doc comment) precisely so this call is the one that actually
+        // shrinks the window back down — deterministically, before anything
+        // is visible, rather than waiting for the next incidental re-render.
+        self.sync_window_height(window);
         // `window.focus` only moves GPUI's own internal notion of which view
         // has keyboard focus — it doesn't ask Windows for OS-level input
         // focus. Without `activate_window()` (raw `SetForegroundWindow`/
@@ -511,10 +542,14 @@ impl IssenApp {
     /// version (`docs/architecture/window-lifecycle.md`): the window stays
     /// OS-visible at all times, and "hidden" is represented purely by
     /// parking it at `OFFSCREEN_POSITION` via a raw `SetWindowPos` call.
+    #[track_caller]
     fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let caller = std::panic::Location::caller();
         if !self.visible {
+            focus_trace(format_args!("hide: already hidden, no-op (from {caller})"));
             return;
         }
+        focus_trace(format_args!("hide: hiding (from {caller})"));
         self.visible = false;
         move_window(
             self.main_hwnd,
@@ -555,7 +590,28 @@ impl IssenApp {
     /// right-click context menu is open, so it doesn't get cut off. Safe to
     /// call every frame (`Window::resize` is only invoked when the value
     /// changes).
+    ///
+    /// **No-ops while hidden.** `gpui_windows`'s `resize()` calls
+    /// `SetWindowPos` without `SWP_NOACTIVATE` (confirmed in the vendored
+    /// `zed-industries/zed` checkout, `crates/gpui_windows/src/window.rs`),
+    /// so it silently reclaims this window as the OS thread's active window
+    /// — even while it's parked off-screen. `hide()` calls this right after
+    /// clearing `results`, which used to trigger exactly that: a spurious
+    /// `WM_ACTIVATE(true)` moments after a real focus-loss deactivation,
+    /// leaving `GetActiveWindow()` pointing at this window again. The next
+    /// `show()` would then see a stale "already active" thread state, making
+    /// its own `activate_window()` a no-op that never fires a real
+    /// `WM_ACTIVATE(true)` — so `seen_active_since_show` stuck at `false`
+    /// for that whole cycle, silently disabling the focus-loss auto-hide
+    /// until the user manually clicked the window once (confirmed via
+    /// `ISSEN_DEBUG_FOCUS_TRACE` real-hotkey tracing, 2026-09-08). Skipping
+    /// the resize while hidden is harmless — the window isn't on-screen for
+    /// its size to matter — and `show()` calls this again before activating,
+    /// so the size is always correct by the time it's visible.
     fn sync_window_height(&mut self, window: &mut Window) {
+        if !self.visible {
+            return;
+        }
         let rows = if self.history_panel_open {
             self.history
                 .queries
@@ -1977,6 +2033,40 @@ fn move_window(hwnd: HWND, x: i32, y: i32) {
 /// alone isn't always enough.
 fn window_is_foreground(hwnd: HWND) -> bool {
     unsafe { GetForegroundWindow() == hwnd }
+}
+
+/// Whether `hwnd` is the *calling thread's* active window right now — a
+/// distinct concept from [`window_is_foreground`] (system-wide). `gpui`'s
+/// `activate()` calls `SetActiveWindow` before `SetForegroundWindow`, and
+/// `SetActiveWindow` fires `WM_ACTIVATE(true)` only on a real transition —
+/// it's a silent no-op (no event) if `hwnd` is already this thread's active
+/// window. Diagnostic-only (see `focus_trace`), used to tell that scenario
+/// apart from a genuine `SetForegroundWindow` failure.
+fn window_is_thread_active(hwnd: HWND) -> bool {
+    unsafe { GetActiveWindow() == hwnd }
+}
+
+/// Temporary diagnostic tracing for the focus-loss auto-hide bug (reported
+/// 2026-09-08: window sometimes fails to hide after losing OS focus).
+/// Dormant unless `ISSEN_DEBUG_FOCUS_TRACE` is set, matching this project's
+/// other `ISSEN_DEBUG_*` investigation hooks. Writes to a file rather than
+/// stderr since release-shaped runs may not have a console attached.
+fn focus_trace(msg: std::fmt::Arguments) {
+    if std::env::var_os("ISSEN_DEBUG_FOCUS_TRACE").is_none() {
+        return;
+    }
+    use std::io::Write as _;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    let elapsed_ms = start.elapsed().as_millis();
+    let path = std::env::temp_dir().join("issen-focus-trace.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[{elapsed_ms:>8}ms] {msg}");
+    }
 }
 
 /// App entry point, called from `main.rs`.
