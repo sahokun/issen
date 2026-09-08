@@ -29,9 +29,9 @@ use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
-    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowHandle, WindowKind,
-    WindowOptions,
+    Pixels, Point, ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
+    UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowHandle, WindowKind, WindowOptions,
 };
 use gpui_platform::application;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -184,6 +184,14 @@ pub struct IssenApp {
     /// that act on `results` (up/down, Enter, Alt+digit) are suspended —
     /// `results` stays stale from the last real search while this is open.
     history_panel_open: bool,
+    /// Shared by the result list and the query-history panel (only one is
+    /// ever shown at a time). Rows beyond `visible_rows_cap()` are still
+    /// rendered — the window itself only grows to fit `visible_rows_cap`
+    /// rows tall — so this is what makes the rest reachable, via mouse
+    /// wheel or keyboard nav (`scroll_to_item`, see `move_up`/`move_down`).
+    /// Reset to the top on every new search and on opening/closing the
+    /// history panel, since it's switching to a different list.
+    scroll_handle: ScrollHandle,
     /// The open right-click context menu, if any (search box background or
     /// a result row). GPUI core has no `context_menu` widget, so this is a
     /// custom `anchored()`/`deferred()` overlay drawn in `render()`.
@@ -254,6 +262,7 @@ impl IssenApp {
             seen_active_since_show: false,
             opening_secondary_window: false,
             history_panel_open: false,
+            scroll_handle: ScrollHandle::new(),
             context_menu: None,
             hotkey,
             tray,
@@ -356,6 +365,7 @@ impl IssenApp {
 
         self.results = results;
         self.selected = 0;
+        self.scroll_handle.set_offset(Point::default());
     }
 
     /// Entry point for both the initial startup scan and a manual reindex
@@ -640,16 +650,7 @@ impl IssenApp {
         if !self.visible {
             return;
         }
-        let rows = if self.history_panel_open {
-            self.history
-                .queries
-                .len()
-                .max(1)
-                .min(self.visible_rows_cap())
-        } else {
-            self.results.len().min(self.visible_rows_cap())
-        } as f32;
-        let mut height = MAIN_WINDOW_SIZE.1 + rows * RESULT_ROW_HEIGHT;
+        let mut height = MAIN_WINDOW_SIZE.1 + self.visible_row_count() as f32 * RESULT_ROW_HEIGHT;
         if self.context_menu.is_some() {
             height += CONTEXT_MENU_HEADROOM;
         }
@@ -662,6 +663,25 @@ impl IssenApp {
 
     fn visible_rows_cap(&self) -> usize {
         (self.config.max_results as usize).min(MAX_VISIBLE_ROWS)
+    }
+
+    /// How tall the result/history list should be *drawn*, in rows — the
+    /// window itself only ever grows to fit this many (`sync_window_height`);
+    /// anything beyond it is still rendered, just reachable only by
+    /// scrolling the fixed-height list container (`render`'s
+    /// `visible_row_count`-sized scroll wrapper), not by growing the
+    /// window further. Even with zero history entries, one row ("no
+    /// history yet") is still drawn, hence `max(1)` in that branch.
+    fn visible_row_count(&self) -> usize {
+        if self.history_panel_open {
+            self.history
+                .queries
+                .len()
+                .max(1)
+                .min(self.visible_rows_cap())
+        } else {
+            self.results.len().min(self.visible_rows_cap())
+        }
     }
 
     /// One of the search box's toolbar icon buttons (color picker, unit
@@ -821,6 +841,7 @@ impl IssenApp {
     /// Toggles the query-history panel (🕘 icon).
     fn toggle_history_panel(&mut self, cx: &mut Context<Self>) {
         self.history_panel_open = !self.history_panel_open;
+        self.scroll_handle.set_offset(Point::default());
         cx.notify();
     }
 
@@ -852,6 +873,7 @@ impl IssenApp {
             return;
         }
         self.selected = self.selected.saturating_sub(1);
+        self.scroll_handle.scroll_to_item(self.selected);
         cx.notify();
     }
 
@@ -862,6 +884,7 @@ impl IssenApp {
         if !self.results.is_empty() {
             self.selected = (self.selected + 1).min(self.results.len() - 1);
         }
+        self.scroll_handle.scroll_to_item(self.selected);
         cx.notify();
     }
 
@@ -1857,13 +1880,12 @@ impl Render for IssenApp {
                     .queries
                     .iter()
                     .enumerate()
-                    // `sync_window_height` sizes the window for at most
-                    // `visible_rows_cap` history rows — without this cap,
-                    // GPUI's default `flex-shrink: 1` on `flex_col` children
-                    // compresses every row to fit whatever's actually
-                    // rendered, making row height (and thus the whole list)
-                    // visibly wobble as the history count crosses that cap.
-                    .take(visible_rows_cap)
+                    // All rows are rendered (not capped to `visible_rows_cap`
+                    // here) — the fixed-height, `overflow_y_scroll` wrapper
+                    // this list is rendered into (below) is what keeps
+                    // `flex_col`'s default flex-shrink from compressing rows
+                    // to fit and makes anything beyond `visible_rows_cap`
+                    // reachable by scrolling instead of just invisible.
                     .map(|(i, query)| {
                         div()
                             .id(("history-row", i))
@@ -1888,14 +1910,9 @@ impl Render for IssenApp {
             self.results
                 .iter()
                 .enumerate()
-                // See the history-row `.take` above — `sync_window_height`
-                // sizes the window for at most `visible_rows_cap` rows, so
-                // rendering more than that would let `flex_col`'s default
-                // shrink behavior compress every row to fit, bobbing the
-                // whole list (and the search box above it, per `flex_none`
-                // there) up and down on every keystroke as the result count
-                // changes.
-                .take(visible_rows_cap)
+                // See the history-row comment above — all rows are rendered
+                // into the fixed-height scroll wrapper below, not capped
+                // here.
                 .map(|(i, result)| {
                     let is_selected = i == self.selected;
                     let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
@@ -1974,6 +1991,22 @@ impl Render for IssenApp {
 
         let context_menu_overlay = self.render_context_menu(cx);
 
+        // Fixed-height wrapper, not just a bare `flex_col` sibling of
+        // `search_box` — matches the height `sync_window_height` already
+        // gives the window (`visible_row_count() * RESULT_ROW_HEIGHT`), so
+        // rows beyond that don't compress everything else to fit (GPUI's
+        // default `flex-shrink: 1`) and are instead reachable by scrolling
+        // this container (mouse wheel, or `move_up`/`move_down`'s
+        // `scroll_to_item`) rather than just invisible.
+        let rows_list = div()
+            .id("results-scroll")
+            .flex_none()
+            .w_full()
+            .h(px(self.visible_row_count() as f32 * RESULT_ROW_HEIGHT))
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
+            .children(rows);
+
         div()
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus_handle)
@@ -2013,7 +2046,7 @@ impl Render for IssenApp {
             .border_1()
             .border_color(hsla(0., 0., 1., 0.14))
             .child(search_box)
-            .children(rows)
+            .child(rows_list)
             .children(context_menu_overlay)
     }
 }
