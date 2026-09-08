@@ -187,9 +187,6 @@ unsafe fn proc<F: Copy>(module: HMODULE, name: &CStr) -> Option<F> {
 /// reachability with the running Everything instance. Called each time the
 /// settings window opens rather than polled continuously, so the few-ms
 /// IPC round-trip cost is acceptable.
-// Not yet called — the settings window that would call it on open isn't
-// ported to GPUI yet (Phase 1 step 4).
-#[allow(dead_code)]
 pub fn is_available() -> bool {
     match API.get_or_init(load_api) {
         Some(api) => unsafe { is_running(api) },

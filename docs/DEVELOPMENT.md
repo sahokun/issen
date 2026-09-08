@@ -99,14 +99,15 @@ pieces (one doc per area).
 
 ## Packaging a release zip
 
-There's no build script for this yet. For now: build in
-release mode, and copy `third_party/Everything64.dll` next to `issen.exe`
-in the zip (`LoadLibraryW` looks in the executable's own folder first).
+`build.rs` copies `third_party/Everything64.dll` next to the built exe in
+`target/<profile>/` on every `cargo build`/`cargo run` (`LoadLibraryW` looks
+in the executable's own folder first), so no manual copy step is needed —
+zip up `target/release/issen.exe` together with the
+`target/release/Everything64.dll` that's already sitting next to it.
 
 ```powershell
 cargo build --release
 ```
 
-Once a build script exists, consider fetching `Everything64.dll` at build
-time instead of committing the binary to the repo (it's currently tracked
-directly under `third_party/`).
+Consider fetching `Everything64.dll` at build time instead of committing the
+binary to the repo (it's currently tracked directly under `third_party/`).
