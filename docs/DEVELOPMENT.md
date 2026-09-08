@@ -3,9 +3,11 @@
 ## Tech stack
 
 - Language: Rust
-- GUI: egui / eframe (glow backend) — chosen to avoid an external runtime
-  dependency and keep startup fast. Being immediate-mode, animations and
-  similar effects need to be hand-rolled.
+- GUI: [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
+  (pinned to a `zed-industries/zed` git revision — pre-1.0, crates.io
+  doesn't yet publish the Windows-backend crates this app needs; see
+  `Cargo.toml`). Retained-mode with a GPU-composited render tree, unlike
+  the immediate-mode egui/eframe this app used before the GPUI migration.
 - Windows API integration: the `windows` crate (COM / Shell interfaces)
 - Config: `serde` + `toml`
 
