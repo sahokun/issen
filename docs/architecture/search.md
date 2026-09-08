@@ -44,18 +44,26 @@ Three mechanisms:
   channel from a background executor thread, waking the view exactly once
   — unlike the egui/eframe version's `poll_scan`, which was called every
   frame from its render loop.
-- **Known gap, currently open:** periodic rescans (intended: every 30
-  minutes, `app.rs::PERIODIC_RESCAN_INTERVAL`) are not actually wired up
-  in the GPUI port. `IssenApp::next_periodic_scan` still exists and is
-  updated on every scan completion, but nothing currently reads or
-  compares it against `Instant::now()` to trigger a rescan when it
-  elapses — the egui/eframe version's timer (`egui::Context::
-  request_repaint_after`, which woke a hidden window's render loop
-  without burning CPU every frame) was never re-implemented as a GPUI
-  equivalent (e.g. a `cx.spawn` loop using `cx.background_executor()
-  .timer(...)`, the same pattern this app already uses elsewhere for the
-  tools window's eyedropper poll). Until this is fixed, the index only
-  updates via the startup scan and manual reindex.
+- Periodic rescans (every 30 minutes, `app.rs::PERIODIC_RESCAN_INTERVAL`):
+  `IssenApp::start_periodic_rescan_loop`, a `cx.spawn` loop that sleeps via
+  `cx.background_executor().timer(...)` and calls `start_scan` on each
+  wake — the same underlying pattern the tools window's eyedropper poll
+  uses, replacing the egui/eframe version's `egui::Context::
+  request_repaint_after` (which woke a hidden window's render loop without
+  burning CPU every frame).
+  - Deliberately a flat "sleep a fixed interval, then fire" loop, not one
+    that tracks a shared "next scan due at" deadline field reset by
+    `on_scan_finished` after a manual rescan (which would in principle
+    debounce redundant rescans more precisely). An earlier version tried
+    exactly that and raced with itself on real hardware: `start_scan` only
+    *starts* a scan and returns immediately, so a loop iteration that
+    re-reads the shared deadline right after firing can still see a stale,
+    already-elapsed value (the in-flight scan hasn't finished yet to push
+    it forward) and fire again immediately — observed as a tight ~20ms
+    re-fire loop. `start_scan`'s own `self.scanning` guard already
+    prevents overlapping scans, which is all this loop actually needs; the
+    cost of not debouncing against a manual rescan is at most one
+    redundant (harmless) extra scan near the interval boundary.
 - Manual rescan from the tray menu, the input box's right-click menu, or
   the settings window — all three call the same `start_scan`, which also
   guards against overlapping scans.

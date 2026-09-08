@@ -203,7 +203,6 @@ pub struct IssenApp {
     pub(crate) scanning: bool,
     pub(crate) last_scan_finished: Option<Instant>,
     pub(crate) last_scan_count: usize,
-    next_periodic_scan: Instant,
 
     main_hwnd: HWND,
 }
@@ -267,11 +266,11 @@ impl IssenApp {
             scanning: false,
             last_scan_finished: None,
             last_scan_count: 0,
-            next_periodic_scan: Instant::now() + PERIODIC_RESCAN_INTERVAL,
             main_hwnd,
             config,
         };
         app.start_scan(cx);
+        Self::start_periodic_rescan_loop(cx);
 
         // Matches the egui/eframe version's `WindowFocused(false)` handling:
         // losing OS focus hides the window, unless a secondary window (about/
@@ -396,13 +395,42 @@ impl IssenApp {
         .detach();
     }
 
+    /// Wakes `start_scan` every `PERIODIC_RESCAN_INTERVAL`, without a
+    /// per-frame poll — same underlying `cx.background_executor().timer`
+    /// pattern as the tools window's eyedropper (`tools/mod.rs::
+    /// start_eyedropper`/`poll_eyedropper`). Started once from `new`;
+    /// detached, so it runs for the app's whole lifetime.
+    ///
+    /// Deliberately a flat "sleep, then fire" loop rather than tracking a
+    /// shared `next_periodic_scan`-style deadline field that `on_scan_
+    /// finished` also writes to reset the clock after a manual rescan: an
+    /// earlier version tried that and raced with itself on real hardware —
+    /// `start_scan` only *starts* a scan and returns immediately, so a
+    /// deadline read right after firing was still stale (not yet pushed
+    /// forward by the in-flight scan's own completion), producing a second,
+    /// spurious near-immediate fire every cycle. `start_scan`'s own
+    /// `self.scanning` guard already prevents overlapping scans, which is
+    /// all this loop actually needs — the cost of not resetting on a manual
+    /// rescan is at most one redundant (harmless, no-op-if-still-scanning)
+    /// extra scan near the boundary, which is far cheaper than the race.
+    fn start_periodic_rescan_loop(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(PERIODIC_RESCAN_INTERVAL)
+                .await;
+            let Ok(()) = this.update(cx, |view, cx| view.start_scan(cx)) else {
+                break;
+            };
+        })
+        .detach();
+    }
+
     fn on_scan_finished(&mut self, provider: AppIndexProvider, cx: &mut Context<Self>) {
         self.last_scan_count = provider.len();
         self.last_scan_finished = Some(Instant::now());
         self.app_index = provider;
         self.scanning = false;
         self.tray.set_scanning(self.strings, false);
-        self.next_periodic_scan = Instant::now() + PERIODIC_RESCAN_INTERVAL;
         if !self.query.is_empty() {
             self.run_search();
         }
