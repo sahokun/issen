@@ -29,9 +29,10 @@ fn detect_system_lang() -> Lang {
     }
 }
 
-// Most fields below back the settings/about/tools windows and the
-// right-click context menu, none of which are ported to GPUI yet (Phase 1
-// step 4) — so most of this struct's fields aren't read from anywhere yet.
+// A handful of fields (e.g. an old button/placeholder label superseded by a
+// later UI redesign) aren't read by any window right now; kept rather than
+// deleted since removing a field means removing it from both language
+// tables too, for no behavior change.
 #[allow(dead_code)]
 pub struct Strings {
     pub tray_open: &'static str,
@@ -368,8 +369,6 @@ impl Strings {
 
 /// Determines which language table a `Strings` reference is, by comparing it against the
 /// known `JA` instance (`Strings` itself carries no language tag).
-// Not yet called — used by the settings window, not ported to GPUI yet (Phase 1 step 4).
-#[allow(dead_code)]
 pub fn lang_of(strings: &'static Strings) -> Lang {
     if std::ptr::eq(strings, &JA) {
         Lang::Ja
@@ -381,7 +380,6 @@ pub fn lang_of(strings: &'static Strings) -> Lang {
 /// Read-only "last index update" display text shown in the settings window. Implemented as
 /// one function rather than concatenated string fragments, since sentence structure differs
 /// between languages.
-#[allow(dead_code)]
 pub fn last_scan_text(lang: Lang, minutes_ago: u64, count: usize) -> String {
     match lang {
         Lang::En => format!("Last updated {minutes_ago} min ago · {count} apps found"),
