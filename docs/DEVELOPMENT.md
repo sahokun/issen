@@ -99,17 +99,29 @@ pushes.
 See [`docs/architecture/`](architecture/) for the rationale behind these
 pieces (one doc per area).
 
-## Packaging a release zip
+## Releasing
 
-`build.rs` copies `third_party/Everything64.dll` next to the built exe in
-`target/<profile>/` on every `cargo build`/`cargo run` (`LoadLibraryW` looks
-in the executable's own folder first), so no manual copy step is needed —
-zip up `target/release/issen.exe` together with the
-`target/release/Everything64.dll` that's already sitting next to it.
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) builds
+and publishes a release zip automatically when a `vX.Y.Z` tag is pushed. To
+cut a release:
 
-```powershell
-cargo build --release
-```
+1. Bump `version` in [`Cargo.toml`](../Cargo.toml) to `X.Y.Z` and commit —
+   this value is shown in the app's About window
+   (`env!("CARGO_PKG_VERSION")` in `src/about_window.rs`), so it must match
+   the tag.
+2. Tag and push:
+
+   ```powershell
+   git tag vX.Y.Z
+   git push origin vX.Y.Z
+   ```
+
+3. The workflow runs on `windows-latest`, fails fast if the tag doesn't
+   match `Cargo.toml`'s `version`, then runs `cargo build --release` and
+   publishes a GitHub Release with `issen-vX.Y.Z-windows-x64.zip`
+   containing `issen.exe` and `Everything64.dll` (`build.rs` already copies
+   the DLL next to the exe in `target/<profile>/` on every build, since
+   `LoadLibraryW` looks in the executable's own folder first).
 
 Consider fetching `Everything64.dll` at build time instead of committing the
 binary to the repo (it's currently tracked directly under `third_party/`).

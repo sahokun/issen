@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}" -replace '^v', ''
+          $cargoToml = Get-Content Cargo.toml -Raw
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            Write-Error "Cargo.toml から version を読み取れませんでした"
+            exit 1
+          }
+          $cargoVersion = $matches[1]
+          if ($tagVersion -ne $cargoVersion) {
+            Write-Error "タグ v$tagVersion と Cargo.toml の version ($cargoVersion) が一致しません"
+            exit 1
+          }
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $zipName = "issen-${{ github.ref_name }}-windows-x64.zip"
+          Compress-Archive -Path "target/release/issen.exe", "target/release/Everything64.dll" -DestinationPath $zipName
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true
