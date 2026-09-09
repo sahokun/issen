@@ -3,9 +3,11 @@
 ## Tech stack
 
 - Language: Rust
-- GUI: egui / eframe (glow backend) — chosen to avoid an external runtime
-  dependency and keep startup fast. Being immediate-mode, animations and
-  similar effects need to be hand-rolled.
+- GUI: [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui)
+  (pinned to a `zed-industries/zed` git revision — pre-1.0, crates.io
+  doesn't yet publish the Windows-backend crates this app needs; see
+  `Cargo.toml`). Retained-mode with a GPU-composited render tree, unlike
+  the immediate-mode egui/eframe this app used before the GPUI migration.
 - Windows API integration: the `windows` crate (COM / Shell interfaces)
 - Config: `serde` + `toml`
 
@@ -99,14 +101,15 @@ pieces (one doc per area).
 
 ## Packaging a release zip
 
-There's no build script for this yet. For now: build in
-release mode, and copy `third_party/Everything64.dll` next to `issen.exe`
-in the zip (`LoadLibraryW` looks in the executable's own folder first).
+`build.rs` copies `third_party/Everything64.dll` next to the built exe in
+`target/<profile>/` on every `cargo build`/`cargo run` (`LoadLibraryW` looks
+in the executable's own folder first), so no manual copy step is needed —
+zip up `target/release/issen.exe` together with the
+`target/release/Everything64.dll` that's already sitting next to it.
 
 ```powershell
 cargo build --release
 ```
 
-Once a build script exists, consider fetching `Everything64.dll` at build
-time instead of committing the binary to the repo (it's currently tracked
-directly under `third_party/`).
+Consider fetching `Everything64.dll` at build time instead of committing the
+binary to the repo (it's currently tracked directly under `third_party/`).

@@ -1,218 +1,232 @@
-//! Theme constants for the translucent glass panel shared by the settings
-//! window, color picker, unit converter, and main search box. Implemented
-//! via `with_transparent(true)` + zero-alpha `clear_color` + a rounded,
-//! translucent rectangle painted by `painter` — verified on real hardware,
-//! not dependent on DWM composition APIs like Mica/Acrylic (see
-//! docs/architecture/ui-appearance.md).
+//! Theme constants and chrome shared by the secondary windows (about,
+//! settings, tools): a translucent glass panel background plus a custom
+//! title bar with drag-to-move and a close button. GPUI's default window
+//! decorations are used nowhere in this app (see `docs/architecture/
+//! window-lifecycle.md`), so every window paints its own.
 
-/// The actual color for a given `config.accent_color`. The default `Lime`
-/// is the reference design's `oklch(0.9 0.19 124)` converted to sRGB (same
-/// value as the old fixed `ACCENT` constant). The other colors are
-/// pre-converted the same way, keeping roughly the same OKLCH lightness and
-/// chroma and only varying hue, and are shared across light/dark (the
-/// accent stays fixed as a brand color regardless of theme).
-pub fn accent_color(theme: crate::config::AccentColor) -> egui::Color32 {
-    use crate::config::AccentColor;
-    match theme {
-        AccentColor::Lime => egui::Color32::from_rgb(196, 242, 82),
-        AccentColor::Red => egui::Color32::from_rgb(255, 116, 110),
-        AccentColor::Orange => egui::Color32::from_rgb(255, 166, 61),
-        AccentColor::Blue => egui::Color32::from_rgb(108, 195, 255),
-        AccentColor::Purple => egui::Color32::from_rgb(215, 152, 255),
+use gpui::{
+    div, hsla, px, rems, rgba, Div, Hsla, InteractiveElement, MouseButton, ParentElement,
+    SharedString, Styled, Window, WindowAppearance, WindowControlArea,
+};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{
+    SetWindowPos, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+};
+
+use crate::config::Theme;
+
+/// `Window` has an inherent `window_handle()` method (returns GPUI's own
+/// `AnyWindowHandle`, not an HWND) with the same name as the
+/// `HasWindowHandle` trait method, so the trait method must be called
+/// fully-qualified to get the actual HWND (same gotcha as `app.rs`'s
+/// private copy of this for the main window).
+pub fn window_hwnd(window: &Window) -> Option<HWND> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut core::ffi::c_void)),
+        _ => None,
     }
 }
 
-/// Set to `0.0` (square) rather than rounded. Painting this panel with
-/// rounded corners caused a visible seam on dark wallpaper, where the
-/// corner cutout (the part of the panel rect outside the rounded arc, left
-/// transparent via zero-alpha `clear_color`) showed up as a hard edge; the
-/// root cause was never pinned down, so this was dropped to `0.0` as a
-/// workaround instead. On real hardware the window still ends up with a
-/// slight, seam-free rounding regardless of this constant — that's Windows
-/// 11's own automatic corner rounding, a separate layer from this panel's
-/// paint call — so the final look is unaffected by keeping this at `0.0`,
-/// and there's no need to revisit rounding it here again.
-pub const PANEL_ROUNDING: f32 = 0.0;
+/// Puts a secondary window in the OS topmost band. Needed because the main
+/// search window (`app.rs::run`) is itself always-on-top
+/// (`WindowKind::PopUp` there doesn't imply topmost on Windows) — without
+/// this, a secondary window opened while the main window is visible ends up
+/// behind it. GPUI's `WindowOptions` has no cross-platform equivalent, so
+/// this goes straight to the same raw `SetWindowPos` call the egui/eframe
+/// version used via `.with_always_on_top()`.
+pub fn set_topmost(window: &Window) {
+    let Some(hwnd) = window_hwnd(window) else {
+        return;
+    };
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
 
-/// A full glass-panel color set. [`palette`] picks one based on
-/// `config.theme`'s light/dark resolution (`ui.visuals().dark_mode`).
-/// Unlike the main search box, which always stays dark regardless of theme
-/// (see docs/architecture/ui-appearance.md), the settings window and tool windows follow both
-/// light and dark.
+/// GPUI's default `rem` size — every `.text_size(rems(n))` call in this app
+/// (converted from a literal `px` value by dividing by this) is sized
+/// relative to it. See [`apply_font_scale`].
+const BASE_REM_SIZE: f32 = 16.0;
+
+/// Applies `config.font_scale` to `window` by scaling its `rem` size —
+/// `Window::set_rem_size`'s own doc comment describes this as "just like
+/// zooming a web page". Every text size in the app is expressed via
+/// `.text_size(rems(n))` rather than a literal `px(n)` specifically so this
+/// one call scales all of them at once, without threading a scale factor
+/// through every widget helper individually. Layout metrics (paddings, row
+/// heights, window sizes) stay in literal `px` and don't scale — matching
+/// the egui/eframe version's `apply_font_scale`, which only ever rescaled
+/// `egui::Style::text_styles` for the same reason, and explains why its
+/// slider was clamped to a narrow 0.9-1.25 range: much further outside it
+/// and text starts to clip against those fixed-size rows.
+///
+/// Called at the top of every window's `render()` (not just once at
+/// creation) so a live change from the settings window's font-scale
+/// stepper is picked up on the next repaint of each open window.
+pub fn apply_font_scale(window: &mut Window, font_scale: f32) {
+    window.set_rem_size(px(BASE_REM_SIZE * font_scale.clamp(0.5, 2.0)));
+}
+
+/// Resolves `config.theme` to an actual dark/light bool: `Light`/`Dark` are
+/// explicit overrides, `System` follows the window's real OS appearance.
+pub fn resolve_dark(theme: Theme, window: &Window) -> bool {
+    match theme {
+        Theme::Light => false,
+        Theme::Dark => true,
+        Theme::System => matches!(
+            window.appearance(),
+            WindowAppearance::Dark | WindowAppearance::VibrantDark
+        ),
+    }
+}
+
+/// The actual color for a given `config.accent_color`. The default `Lime`
+/// is the reference design's `oklch(0.9 0.19 124)` converted to sRGB.
+pub fn accent_color(theme: crate::config::AccentColor) -> Hsla {
+    use crate::config::AccentColor;
+    match theme {
+        AccentColor::Lime => rgba(0xC4F252FFu32).into(),
+        AccentColor::Red => rgba(0xFF746EFFu32).into(),
+        AccentColor::Orange => rgba(0xFFA63DFFu32).into(),
+        AccentColor::Blue => rgba(0x6CC3FFFFu32).into(),
+        AccentColor::Purple => rgba(0xD798FFFFu32).into(),
+    }
+}
+
+/// A full glass-panel color set. [`palette`] picks one based on the
+/// window's actual OS appearance (`Window::appearance`), same values as
+/// the egui/eframe version's `GlassPalette`.
 pub struct GlassPalette {
-    pub panel_bg: egui::Color32,
-    pub border: egui::Color32,
-    pub text: egui::Color32,
-    pub subtext: egui::Color32,
-    pub divider: egui::Color32,
-    pub control_bg: egui::Color32,
-    /// Intended for the color picker's/unit converter's input field borders
-    /// (not wired up yet).
+    pub panel_bg: Hsla,
+    pub border: Hsla,
+    pub text: Hsla,
+    pub subtext: Hsla,
+    pub divider: Hsla,
     #[allow(dead_code)]
-    pub control_border: egui::Color32,
+    pub control_bg: Hsla,
+    #[allow(dead_code)]
+    pub control_border: Hsla,
 }
 
 pub fn palette(dark: bool) -> GlassPalette {
     if dark {
         GlassPalette {
-            panel_bg: egui::Color32::from_rgba_unmultiplied(18, 20, 26, 150),
-            border: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
-            text: egui::Color32::from_rgb(242, 244, 247),
-            subtext: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 97),
-            divider: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
-            control_bg: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 15),
-            control_border: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+            panel_bg: rgba(0x12141A96u32).into(),
+            border: rgba(0xFFFFFF24u32).into(),
+            text: rgba(0xF2F4F7FFu32).into(),
+            subtext: rgba(0xFFFFFF8Fu32).into(),
+            divider: rgba(0xFFFFFF1Au32).into(),
+            control_bg: rgba(0xFFFFFF0Fu32).into(),
+            control_border: rgba(0xFFFFFF1Eu32).into(),
         }
     } else {
         GlassPalette {
-            panel_bg: egui::Color32::from_rgba_unmultiplied(250, 250, 252, 195),
-            border: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
-            text: egui::Color32::from_rgb(30, 32, 36),
-            subtext: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 115),
-            divider: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
-            control_bg: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10),
-            control_border: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 26),
+            panel_bg: rgba(0xFAFAFCC3u32).into(),
+            border: rgba(0x00000012u32).into(),
+            text: rgba(0x1E2024FFu32).into(),
+            subtext: rgba(0x000000A0u32).into(),
+            divider: rgba(0x00000012u32).into(),
+            control_bg: rgba(0x0000000Au32).into(),
+            control_border: rgba(0x0000001Au32).into(),
         }
     }
 }
 
-/// Paints the rounded, translucent panel background and border covering
-/// the whole window. Callers should layer their content on top with a
-/// backgroundless frame, e.g.
-/// `egui::CentralPanel::default().frame(egui::Frame::NONE)`.
-pub fn glass_panel(ui: &egui::Ui, rect: egui::Rect, palette: &GlassPalette) {
-    let painter = ui.painter();
-    painter.rect_filled(rect, PANEL_ROUNDING, palette.panel_bg);
-    painter.rect_stroke(
-        rect,
-        PANEL_ROUNDING,
-        egui::Stroke::new(1.0, palette.border),
-        egui::StrokeKind::Inside,
-    );
+/// A fully opaque variant of [`palette`]'s `panel_bg` (same hue, alpha
+/// forced to 255). For a window that wants the glass chrome's colors but
+/// not the see-through background — settings (`settings_window.rs`) and
+/// tools (`tools/mod.rs`), whose users found the default translucency too
+/// faint to read text against a busy desktop behind it. `palette()` itself
+/// stays untouched so about (which didn't ask for this) isn't affected.
+pub fn opaque_panel_bg(dark: bool) -> Hsla {
+    if dark {
+        rgba(0x12141AFFu32).into()
+    } else {
+        rgba(0xFAFAFCFFu32).into()
+    }
+}
+
+/// A window-filling container already styled with the glass panel
+/// background and border. Callers stack their content into it.
+pub fn glass_container(palette: &GlassPalette) -> Div {
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(palette.panel_bg)
+        .border_1()
+        .border_color(palette.border)
 }
 
 pub const TITLE_BAR_HEIGHT: f32 = 36.0;
-const RESIZE_MARGIN: f32 = 6.0;
 
-/// The custom title bar shared by the settings window, color picker, and
-/// unit converter. Handles window drag-to-move and the close (×) button.
-/// Returns whether the close button was clicked (the caller closes the
-/// window itself).
-///
-/// The drag region uses `Sense::click_and_drag()` — a drag-only `Sense`
-/// silently drops click-type events like a right-click context menu (see
-/// docs/architecture/window-lifecycle.md), so this includes clicking too.
-pub fn title_bar(ui: &mut egui::Ui, rect: egui::Rect, title: &str, palette: &GlassPalette) -> bool {
-    let close_size = 26.0;
-    let close_rect = egui::Rect::from_min_size(
-        egui::pos2(
-            rect.right() - close_size - 8.0,
-            rect.top() + (TITLE_BAR_HEIGHT - close_size) / 2.0,
-        ),
-        egui::vec2(close_size, close_size),
-    );
-    let drag_rect = egui::Rect::from_min_max(
-        rect.min,
-        egui::pos2(close_rect.left() - 4.0, rect.top() + TITLE_BAR_HEIGHT),
-    );
+/// The custom title bar shared by every secondary window: title text on
+/// the left, a close (×) button on the right, and a drag-to-move region
+/// covering the rest. Dragging and closing only touch the window itself
+/// (`Window::start_window_move`/`remove_window`), so neither needs access
+/// to the root entity's state.
+pub fn title_bar(title: impl Into<SharedString>, palette: &GlassPalette) -> Div {
+    // The drag region is a separate child from the close button (rather than
+    // one mouse-down handler on the whole row) so a click on the close
+    // button doesn't also register as a window-move — the two hitboxes
+    // would otherwise overlap and both fire.
+    let drag_region = div()
+        .flex_1()
+        .h_full()
+        .flex()
+        .items_center()
+        // `Window::start_window_move` is a no-op on Windows (its own doc
+        // comment says "for Linux and macOS") — real Windows window-drag
+        // goes through the `WM_NCHITTEST` hit-test system, wired up
+        // automatically by GPUI for any element marked as a
+        // `WindowControlArea::Drag` region (see `app.rs`'s main search box
+        // for the same mechanism). `is_movable: true` must also be set on
+        // the window (`WindowOptions`) or Windows ignores this entirely.
+        .window_control_area(WindowControlArea::Drag)
+        .child(
+            div()
+                .text_size(rems(11. / 16.))
+                .text_color(palette.subtext)
+                .child(title.into()),
+        );
 
-    let drag_id = ui.id().with("chrome-drag");
-    let drag_response = ui.interact(drag_rect, drag_id, egui::Sense::click_and_drag());
-    if drag_response.drag_started() {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-    }
-
-    ui.painter().text(
-        egui::pos2(rect.left() + 16.0, rect.top() + TITLE_BAR_HEIGHT / 2.0),
-        egui::Align2::LEFT_CENTER,
-        title,
-        egui::FontId::monospace(11.0),
-        palette.subtext,
-    );
-    ui.painter().hline(
-        rect.left() + 4.0..=rect.right() - 4.0,
-        rect.top() + TITLE_BAR_HEIGHT,
-        egui::Stroke::new(1.0, palette.divider),
-    );
-
-    let close_id = ui.id().with("chrome-close");
-    let close_response = ui.interact(close_rect, close_id, egui::Sense::click());
-    let close_color = if close_response.hovered() {
-        palette.text
-    } else {
-        palette.subtext
-    };
-    ui.painter().text(
-        close_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "\u{2715}",
-        egui::FontId::proportional(13.0),
-        close_color,
-    );
-
-    close_response.clicked()
+    div()
+        .h(px(TITLE_BAR_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_between()
+        .pl(px(16.))
+        .pr(px(8.))
+        .border_b_1()
+        .border_color(palette.divider)
+        .child(drag_region)
+        .child(close_button(palette))
 }
 
-/// Resize handles on the east edge, south edge, and southeast corner.
-/// Starting a drag inside a hit region delegates to the OS via
-/// `ViewportCommand::BeginResize` rather than computing resize behavior by
-/// hand. Only these three directions are handled, as the minimum needed
-/// for windows (like the color picker) whose height varies with content —
-/// north/west aren't used anywhere currently.
-pub fn resize_grips(ui: &mut egui::Ui, rect: egui::Rect) {
-    let m = RESIZE_MARGIN;
-    let corner = m * 2.5;
-
-    let east = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - m, rect.top() + TITLE_BAR_HEIGHT),
-        egui::pos2(rect.right(), rect.bottom() - corner),
-    );
-    let south = egui::Rect::from_min_max(
-        egui::pos2(rect.left() + corner, rect.bottom() - m),
-        egui::pos2(rect.right() - corner, rect.bottom()),
-    );
-    let south_east = egui::Rect::from_min_max(
-        egui::pos2(rect.right() - corner, rect.bottom() - corner),
-        rect.max,
-    );
-
-    resize_grip(
-        ui,
-        east,
-        "east",
-        egui::CursorIcon::ResizeEast,
-        egui::viewport::ResizeDirection::East,
-    );
-    resize_grip(
-        ui,
-        south,
-        "south",
-        egui::CursorIcon::ResizeSouth,
-        egui::viewport::ResizeDirection::South,
-    );
-    resize_grip(
-        ui,
-        south_east,
-        "south-east",
-        egui::CursorIcon::ResizeSouthEast,
-        egui::viewport::ResizeDirection::SouthEast,
-    );
-}
-
-fn resize_grip(
-    ui: &mut egui::Ui,
-    rect: egui::Rect,
-    salt: &str,
-    cursor: egui::CursorIcon,
-    direction: egui::viewport::ResizeDirection,
-) {
-    let id = ui.id().with(("chrome-resize", salt));
-    let response = ui.interact(rect, id, egui::Sense::drag());
-    if response.hovered() || response.dragged() {
-        ui.ctx().set_cursor_icon(cursor);
-    }
-    if response.drag_started() {
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-    }
+fn close_button(palette: &GlassPalette) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(26.))
+        .rounded(px(4.))
+        .text_size(rems(13. / 16.))
+        .text_color(palette.subtext)
+        .hover(|d| d.bg(hsla(0., 0., 1., 0.08)).text_color(palette.text))
+        .on_mouse_down(MouseButton::Left, |_, window, _cx| {
+            window.remove_window();
+        })
+        .child("\u{2715}")
 }

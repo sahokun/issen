@@ -52,22 +52,52 @@ pub fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     (h, s * 100.0, l * 100.0)
 }
 
-/// Converts HSL (hue 0-360 degrees, saturation/lightness 0-100%) to RGB (0-255). Used
-/// when editing the color tool's HSL fields directly
-/// (`tools/mod.rs::show_color_picker`).
-pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
-    let h = h.rem_euclid(360.0);
-    let s = (s / 100.0).clamp(0.0, 1.0);
-    let l = (l / 100.0).clamp(0.0, 1.0);
+/// Converts RGB (0-255) to HSV (hue 0-360 degrees, saturation/value 0-1).
+/// Used by the color picker tool's saturation/value square and hue bar,
+/// which need HSV rather than HSL: an HSV square keeps a single degenerate
+/// edge (value=0 is uniformly black), while an HSL square would have two
+/// (lightness=0 *and* lightness=1 both collapse to a single color),
+/// wasting half the square. See `tools/mod.rs::ToolsWindow`'s `hue`/`sat`/
+/// `val` fields for why hue/saturation are kept as persistent state rather
+/// than recomputed from RGB on every drag step.
+pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let r = r as f32 / 255.0;
+    let g = g as f32 / 255.0;
+    let b = b as f32 / 255.0;
 
-    if s == 0.0 {
-        let v = (l * 255.0).round() as u8;
-        return (v, v, v);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+
+    let v = max;
+    let s = if max == 0.0 { 0.0 } else { delta / max };
+
+    if delta == 0.0 {
+        return (0.0, s, v);
     }
 
-    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h = if max == r {
+        ((g - b) / delta) % 6.0
+    } else if max == g {
+        (b - r) / delta + 2.0
+    } else {
+        (r - g) / delta + 4.0
+    };
+    let h = h * 60.0;
+    let h = if h < 0.0 { h + 360.0 } else { h };
+
+    (h, s, v)
+}
+
+/// Converts HSV (hue 0-360 degrees, saturation/value 0-1) to RGB (0-255).
+pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    let h = h.rem_euclid(360.0);
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+
+    let c = v * s;
     let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = l - c / 2.0;
+    let m = v - c;
 
     let (r1, g1, b1) = match h as u32 {
         0..=59 => (c, x, 0.0),
@@ -109,36 +139,39 @@ mod tests {
     }
 
     #[test]
-    fn rgb_hsl_roundtrip_is_close() {
+    fn pure_red_hsl() {
+        let (h, s, l) = rgb_to_hsl(255, 0, 0);
+        assert!((h - 0.0).abs() < 0.01);
+        assert!((s - 100.0).abs() < 0.01);
+        assert!((l - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn rgb_hsv_roundtrip_is_close() {
         let (r, g, b) = (0xF2, 0xA9, 0x3B);
-        let (h, s, l) = rgb_to_hsl(r, g, b);
-        let (r2, g2, b2) = hsl_to_rgb(h, s, l);
+        let (h, s, v) = rgb_to_hsv(r, g, b);
+        let (r2, g2, b2) = hsv_to_rgb(h, s, v);
         assert!((r as i32 - r2 as i32).abs() <= 1);
         assert!((g as i32 - g2 as i32).abs() <= 1);
         assert!((b as i32 - b2 as i32).abs() <= 1);
     }
 
     #[test]
-    fn holding_hue_and_saturation_survives_round_trip_through_white() {
-        // The color tool's HSL fields hold h/s/l as editable state and don't recompute
-        // h/s from `self.color` on an L-only change (see
-        // `tools/mod.rs::ToolsState::hsl`). This test checks the `hsl_to_rgb`
-        // assumption that design relies on: holding red's h/s while round-tripping L
-        // through 100 (white) and back to 50 returns to red, as long as h/s aren't
-        // recomputed from the fully-desaturated white in between.
-        let (h, s, _l) = rgb_to_hsl(255, 0, 0);
-        assert_eq!(hsl_to_rgb(h, s, 100.0), (255, 255, 255));
-        let back = hsl_to_rgb(h, s, 50.0);
-        assert!((back.0 as i32 - 255).abs() <= 1);
-        assert!((back.1 as i32).abs() <= 1);
-        assert!((back.2 as i32).abs() <= 1);
+    fn pure_red_hsv() {
+        let (h, s, v) = rgb_to_hsv(255, 0, 0);
+        assert!((h - 0.0).abs() < 0.01);
+        assert!((s - 1.0).abs() < 0.01);
+        assert!((v - 1.0).abs() < 0.01);
     }
 
     #[test]
-    fn pure_red_hsl() {
-        let (h, s, l) = rgb_to_hsl(255, 0, 0);
-        assert!((h - 0.0).abs() < 0.01);
-        assert!((s - 100.0).abs() < 0.01);
-        assert!((l - 50.0).abs() < 0.01);
+    fn hsv_black_has_zero_value() {
+        assert_eq!(hsv_to_rgb(0.0, 0.0, 0.0), (0, 0, 0));
+        assert_eq!(rgb_to_hsv(0, 0, 0), (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn hsv_white_has_zero_saturation() {
+        assert_eq!(hsv_to_rgb(120.0, 0.0, 1.0), (255, 255, 255));
     }
 }

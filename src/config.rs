@@ -14,8 +14,9 @@ pub struct Config {
     /// The accent color theme, independent of the light/dark `theme` axis.
     /// `src/ui_chrome.rs::accent_color` converts this to an actual color.
     pub accent_color: AccentColor,
-    /// UI-wide font size multiplier, default `1.0`. `src/app.rs`'s
-    /// `apply_font_scale` scales `egui::Style::text_styles` by this.
+    /// UI-wide font size multiplier, default `1.0`. `ui_chrome::
+    /// apply_font_scale` applies this by scaling the window's GPUI `rem`
+    /// size; the settings window's stepper clamps it to `0.9..=1.25`.
     pub font_scale: f32,
     pub language: Language,
     /// Which display the search results window shows on.
@@ -28,8 +29,10 @@ pub struct Config {
     /// shortcut set (`search/windows_settings.rs`'s `ENTRIES`). The
     /// built-in ones can't be edited or deleted.
     pub custom_windows_shortcuts: Vec<WindowsShortcutEntry>,
-    /// The Latin proportional typeface used for UI chrome. Doesn't affect
-    /// the CJK fallback fonts (Meiryo etc., see `src/fonts.rs`).
+    /// The Latin proportional typeface used for UI chrome. `src/fonts.rs`'s
+    /// `ui_font_family` maps this to the actual Win32 family name; CJK
+    /// glyphs fall back automatically regardless of which one is chosen
+    /// (see that function's doc comment).
     pub ui_font: UiFont,
 }
 

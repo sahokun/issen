@@ -1,74 +1,72 @@
-use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Mutex, OnceLock};
 
+use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 use crate::i18n::Strings;
 
-/// `MenuEvent::receiver()` is a global channel, but a hidden window receives
-/// no OS input events, so nothing would ever call `try_recv()` again and
-/// `logic()` would never re-run on a click (the same problem documented on
-/// `hotkey.rs::spawn`: a hidden window gets no OS input events, so without
-/// this, `update()` never gets called). `MenuEvent::set_event_handler` lets
-/// us call `ctx.request_repaint()` as soon as an event arrives, which wakes
-/// egui's event loop.
+/// `MenuEvent::set_event_handler` runs its callback directly from `muda`'s
+/// own message handling, on whatever thread that happens to be — not
+/// necessarily GPUI's main thread, and GPUI's `AsyncApp` is `!Send` so it
+/// can't be touched from here directly. Forwarding through this channel
+/// lets a `cx.spawn` foreground task (`app.rs`) `.await` events and wake the
+/// window from a context where `AsyncApp` is actually usable.
 ///
 /// `set_event_handler` can only be set once per process (`muda` holds it in
-/// a `OnceCell`; later calls are ignored), so the receiving channel is a
-/// `static` that outlives `TrayHandle` being rebuilt (e.g. on a language
-/// switch in `apply_language`).
-///
-/// `ctx.request_repaint()` above is not actually reliable while the main
-/// window is hidden: it schedules a wakeup via eframe's invisible-window
-/// repaint machinery, but that wakeup can be silently dropped (confirmed by
-/// instrumentation — a `Quit` click's `MenuEvent` arrived here immediately,
-/// yet `logic()` didn't run again for several seconds in one run and never
-/// did in another, leaving `try_recv_menu_action`'s poll starved forever).
-/// Quit can't tolerate that, so it's special-cased right here in the
-/// handler — which demonstrably always runs, since `muda` calls it directly
-/// from its own message handling rather than through egui's repaint/poll
-/// cycle — instead of going through the `TrayAction` channel like every
-/// other tray action.
-static FORWARDED_EVENTS: OnceLock<Mutex<Receiver<MenuEvent>>> = OnceLock::new();
+/// a `OnceCell`; later calls are ignored), so the sending/receiving channel
+/// is a `static` that outlives `TrayHandle` being rebuilt (e.g. on a
+/// language switch in `apply_language`).
+static FORWARDED_EVENTS: OnceLock<Mutex<Option<UnboundedReceiver<MenuEvent>>>> = OnceLock::new();
 
 /// Fixed id for the tray menu's Quit item, so the event handler below can
 /// recognize it without needing a `TrayHandle` (which doesn't exist yet when
 /// `set_event_handler` is registered — see `ensure_event_forwarding`).
 const QUIT_MENU_ID: &str = "issen-tray-quit";
 
-fn ensure_event_forwarding(ctx: &egui::Context) {
-    FORWARDED_EVENTS.get_or_init(|| {
-        let (tx, rx) = channel::<MenuEvent>();
-        let ctx = ctx.clone();
-        MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if event.id == MenuId::new(QUIT_MENU_ID) {
-                std::process::exit(0);
-            }
-            let _ = tx.send(event);
-            ctx.request_repaint();
-        }));
-        Mutex::new(rx)
-    });
+/// Returns the receiver only the first time this is called (later calls,
+/// e.g. from `apply_language` rebuilding the tray, see `None` — the
+/// original receiver is still being awaited by the `cx.spawn` task started
+/// at startup, so it must not be handed out twice).
+fn ensure_event_forwarding() -> Option<UnboundedReceiver<MenuEvent>> {
+    FORWARDED_EVENTS
+        .get_or_init(|| {
+            let (tx, rx) = unbounded::<MenuEvent>();
+            // Quit can't tolerate ever being missed, so it's special-cased right
+            // here in the handler — which demonstrably always runs, since `muda`
+            // calls it directly from its own message handling — instead of going
+            // through the `TrayAction` channel like every other tray action.
+            MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+                if event.id == MenuId::new(QUIT_MENU_ID) {
+                    std::process::exit(0);
+                }
+                let _ = tx.unbounded_send(event);
+            }));
+            Mutex::new(Some(rx))
+        })
+        .lock()
+        .ok()
+        .and_then(|mut rx| rx.take())
 }
 
 /// `TrayIconEvent::set_event_handler` has its own separate process-wide
 /// `OnceCell` (a `tray-icon`-side mechanism distinct from `muda`'s), so it
-/// needs a second channel following the same pattern as `FORWARDED_EVENTS`
-/// for the same two reasons: a hidden window needs `ctx.request_repaint()`
-/// to wake up, and the channel needs to outlive `TrayHandle` rebuilds.
-static FORWARDED_TRAY_ICON_EVENTS: OnceLock<Mutex<Receiver<TrayIconEvent>>> = OnceLock::new();
+/// needs a second channel following the same pattern as `FORWARDED_EVENTS`.
+static FORWARDED_TRAY_ICON_EVENTS: OnceLock<Mutex<Option<UnboundedReceiver<TrayIconEvent>>>> =
+    OnceLock::new();
 
-fn ensure_tray_icon_event_forwarding(ctx: &egui::Context) {
-    FORWARDED_TRAY_ICON_EVENTS.get_or_init(|| {
-        let (tx, rx) = channel::<TrayIconEvent>();
-        let ctx = ctx.clone();
-        TrayIconEvent::set_event_handler(Some(move |event| {
-            let _ = tx.send(event);
-            ctx.request_repaint();
-        }));
-        Mutex::new(rx)
-    });
+fn ensure_tray_icon_event_forwarding() -> Option<UnboundedReceiver<TrayIconEvent>> {
+    FORWARDED_TRAY_ICON_EVENTS
+        .get_or_init(|| {
+            let (tx, rx) = unbounded::<TrayIconEvent>();
+            TrayIconEvent::set_event_handler(Some(move |event| {
+                let _ = tx.unbounded_send(event);
+            }));
+            Mutex::new(Some(rx))
+        })
+        .lock()
+        .ok()
+        .and_then(|mut rx| rx.take())
 }
 
 pub enum TrayAction {
@@ -94,16 +92,29 @@ pub struct TrayHandle {
     about_id: MenuId,
 }
 
+/// Takes the `MenuEvent` receiver. Only returns `Some` the first time this
+/// is called process-wide — call once at startup and hand the receiver to a
+/// `cx.spawn` foreground task that awaits it for the app's whole lifetime
+/// (see `app.rs`). A `TrayHandle` rebuild (e.g. `apply_language`) does not
+/// call this again; matching a received event against the *current*
+/// `TrayHandle`'s ids is done via `match_menu_action` instead, so the one
+/// long-lived task keeps working across rebuilds.
+pub fn take_menu_event_receiver() -> Option<UnboundedReceiver<MenuEvent>> {
+    ensure_event_forwarding()
+}
+
+/// Same as `take_menu_event_receiver`, for tray icon clicks.
+pub fn take_tray_icon_event_receiver() -> Option<UnboundedReceiver<TrayIconEvent>> {
+    ensure_tray_icon_event_forwarding()
+}
+
 impl TrayHandle {
     /// Returns `None` if creating the tray icon fails, which can happen at
     /// times other than startup (e.g. `explorer.exe` restarting). Callers
     /// may panic on a startup failure, but a rebuild triggered by something
     /// like a language switch should fall back to keeping the existing
     /// tray icon instead.
-    pub fn new(ctx: &egui::Context, strings: &Strings) -> Option<Self> {
-        ensure_event_forwarding(ctx);
-        ensure_tray_icon_event_forwarding(ctx);
-
+    pub fn new(strings: &Strings) -> Option<Self> {
         let menu = Menu::new();
         let open_item = MenuItem::new(strings.tray_open, true, None);
         let settings_item = MenuItem::new(strings.tray_settings, true, None);
@@ -167,15 +178,9 @@ impl TrayHandle {
         }
     }
 
-    pub fn try_recv_action(&self) -> Option<TrayAction> {
-        self.try_recv_menu_action()
-            .or_else(Self::try_recv_tray_icon_action)
-    }
-
-    fn try_recv_menu_action(&self) -> Option<TrayAction> {
-        let rx = FORWARDED_EVENTS.get()?;
-        let rx = rx.lock().ok()?;
-        let event = rx.try_recv().ok()?;
+    /// Matches a `MenuEvent` (received via `take_menu_event_receiver`'s
+    /// channel) against this handle's current menu item ids.
+    pub fn match_menu_action(&self, event: &MenuEvent) -> Option<TrayAction> {
         if event.id == self.open_id {
             Some(TrayAction::Open)
         } else if event.id == self.settings_id {
@@ -189,25 +194,19 @@ impl TrayHandle {
         }
     }
 
-    /// Hovering the icon fires frequent `Move`/`Enter` events, so reading
-    /// only one event per frame (as `try_recv_menu_action` does) would let
-    /// a `DoubleClick` event queue up behind them and get processed several
-    /// frames late. Instead, this drains everything currently queued each
-    /// frame and returns a hit if a `DoubleClick` was among them.
-    fn try_recv_tray_icon_action() -> Option<TrayAction> {
-        let rx = FORWARDED_TRAY_ICON_EVENTS.get()?;
-        let rx = rx.lock().ok()?;
-        let mut action = None;
-        while let Ok(event) = rx.try_recv() {
-            if let TrayIconEvent::DoubleClick {
-                button: MouseButton::Left,
-                ..
-            } = event
-            {
-                action = Some(TrayAction::Open);
-            }
+    /// Matches a `TrayIconEvent` (received via
+    /// `take_tray_icon_event_receiver`'s channel) — a left double-click
+    /// opens the main window, same as the tray menu's "Open" item.
+    pub fn match_tray_icon_action(event: &TrayIconEvent) -> Option<TrayAction> {
+        if let TrayIconEvent::DoubleClick {
+            button: MouseButton::Left,
+            ..
+        } = event
+        {
+            Some(TrayAction::Open)
+        } else {
+            None
         }
-        action
     }
 }
 

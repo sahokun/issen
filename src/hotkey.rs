@@ -1,6 +1,7 @@
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::thread;
 
+use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -19,7 +20,6 @@ const VK_SPACE: u32 = 0x20;
 const WM_UPDATE_HOTKEY: u32 = WM_APP + 1;
 
 pub struct HotkeyListener {
-    receiver: Receiver<()>,
     /// The thread that update messages get posted to. Sent back by
     /// `spawn`'s thread once it starts (`GetCurrentThreadId()` can only be
     /// read from within the thread itself). `update_hotkey` is never
@@ -31,10 +31,11 @@ pub struct HotkeyListener {
 
 impl HotkeyListener {
     /// Runs its own message loop on a background thread, listening for the
-    /// global hotkey. On a hotkey press, it both notifies via the channel
-    /// and calls `ctx.request_repaint()` to wake egui's event loop (a
-    /// hidden window receives no OS input events, so without this,
-    /// `update()` never gets called).
+    /// global hotkey. On a hotkey press, it notifies via the returned
+    /// `UnboundedReceiver` — GPUI's `AsyncApp` is `!Send` and can't be
+    /// touched from this background thread directly, so the caller is
+    /// expected to `.await` the receiver from a `cx.spawn` foreground task
+    /// and wake the window from there (see `app.rs`).
     ///
     /// `hotkey_spec` is `config.hotkey` (e.g. `"Alt+Space"`). If it fails
     /// to parse, this falls back to the default `Alt+Space` — but only for
@@ -44,8 +45,8 @@ impl HotkeyListener {
     /// keystroke; if invalid partial input like `"C"` → `"Ct"` → `"Ctrl+"`
     /// fell back to Alt+Space each time, the live global hotkey would keep
     /// changing out from under the user while they're still typing.
-    pub fn spawn(ctx: egui::Context, hotkey_spec: String) -> Self {
-        let (toggle_tx, toggle_rx) = channel();
+    pub fn spawn(hotkey_spec: String) -> (Self, UnboundedReceiver<()>) {
+        let (toggle_tx, toggle_rx) = unbounded();
         let (update_tx, update_rx) = channel::<String>();
         let (thread_id_tx, thread_id_rx) = channel();
 
@@ -79,8 +80,7 @@ impl HotkeyListener {
                 }
                 match msg.message {
                     WM_HOTKEY => {
-                        let _ = toggle_tx.send(());
-                        ctx.request_repaint();
+                        let _ = toggle_tx.unbounded_send(());
                     }
                     WM_UPDATE_HOTKEY => {
                         let Ok(new_spec) = update_rx.try_recv() else {
@@ -108,15 +108,11 @@ impl HotkeyListener {
         });
 
         let thread_id = thread_id_rx.recv().unwrap_or(0);
-        Self {
-            receiver: toggle_rx,
+        let listener = Self {
             thread_id,
             update_tx,
-        }
-    }
-
-    pub fn try_recv_toggle(&self) -> bool {
-        self.receiver.try_recv().is_ok()
+        };
+        (listener, toggle_rx)
     }
 
     /// Re-registers the hotkey while running (reflects a settings-window

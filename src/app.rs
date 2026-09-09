@@ -1,13 +1,50 @@
+//! GPUI移行後のメインウィンドウ(検索ボックス+結果ドロップダウン)。
+//!
+//! egui/eframe版からの移行に伴う設計変更点(詳細はdocs/architecture配下の
+//! GPUI移行計画とdocs/architecture/window-lifecycle.mdを参照):
+//!   - GPUI本体にTextEdit相当の完成品ウィジェットが無いため、`IssenApp`
+//!     自身が`EntityInputHandler`を実装して検索ボックスを自前実装している
+//!     (`examples/gpui_spike_input.rs`のTextInputを土台にした移植 — IME
+//!     対応の下線付きmarked_range描画を含む)。
+//!   - `window.request_animation_frame()`による毎フレームポーリングは
+//!     使わず、ホットキー/トレイイベントは`futures::channel::mpsc`と
+//!     `App::spawn`によるイベント駆動の待受けにしている
+//!     (`hotkey.rs`/`tray.rs`のAPIもこの前提でegui非依存に書き換え済み)。
+//!   - about/settings/toolsウィンドウ(`about_window.rs`/`settings_window.rs`/
+//!     `tools/mod.rs`)を移植済み。設定・toolsのテキスト入力欄は
+//!     `text_input.rs`の汎用`TextInput`エンティティを再利用している。
+//!   - 右クリックコンテキストメニュー(GPUI本体に`context_menu`相当の完成品
+//!     ウィジェットが無いため、`anchored()`+`deferred()`による自作オーバーレイ)
+//!     とクエリ履歴パネルも移植済み。起動時の合成フリッカー対策(layered
+//!     prime)とshow/hideのフェードインアニメーションは、Phase 0スパイクで
+//!     GPUI自体にはちらつきが再発しないことを実機確認済みのため保留
+//!     (再発が実際に観測された場合のみ追加する)。
+
+use std::ops::Range;
 use std::time::{Duration, Instant};
 
+use futures::StreamExt;
+use gpui::{
+    actions, anchored, deferred, div, fill, hsla, point, prelude::*, px, rems, size, white,
+    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
+    KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
+    Pixels, Point, ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
+    UnderlineStyle, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowHandle, WindowKind, WindowOptions,
+};
+use gpui_platform::application;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use unicode_segmentation::UnicodeSegmentation;
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, GetWindowRect, SetLayeredWindowAttributes, SetWindowLongPtrW, GWL_EXSTYLE,
-    LWA_ALPHA, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    GetForegroundWindow, GetWindowLongPtrW, SetWindowLongPtrW, SetWindowPos, GWL_EXSTYLE,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, WS_EX_TOOLWINDOW,
 };
 
-use crate::config::{self, Config, Theme};
+use crate::about_window::{self, AboutWindow};
+use crate::config::{self, Config};
 use crate::hotkey::HotkeyListener;
 use crate::i18n::{self, Lang, Strings};
 use crate::search::alias::AliasProvider;
@@ -16,375 +53,290 @@ use crate::search::everything::EverythingProvider;
 use crate::search::plugin::PluginProvider;
 use crate::search::windows_settings::WindowsSettingsProvider;
 use crate::search::{Action, SearchProvider, SearchResult};
-use crate::settings_window::SettingsWindow;
-use crate::tray::{TrayAction, TrayHandle};
+use crate::tools::{self, ToolKind, ToolsWindow};
+use crate::tray::{self, TrayAction, TrayHandle};
+use crate::ui_chrome;
 
-/// Interval between periodic automatic rescans (see docs/architecture/search.md).
-const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(30 * 60);
-
-/// Main window size. Must match `main.rs`'s `ViewportBuilder::with_inner_size`
-/// (used when computing where to center the window on the cursor's display when shown).
-/// This is also the window's height with zero search results (the window grows
-/// downward from this height as results appear).
+/// Main window size (zero-results height). See `docs/architecture/window-lifecycle.md`.
 pub const MAIN_WINDOW_SIZE: (f32, f32) = (640.0, 60.0);
-
-/// The coordinate the main window is actually moved to when logically "hidden".
-/// A fixed point outside every monitor's bounds (`-32000` is avoided because Windows
-/// treats it as a sentinel value for a minimized window's position). `main.rs` also
-/// uses this as the window's initial position at startup (see
-/// docs/architecture/window-lifecycle.md, and `set_visible`'s doc comment).
+/// Fixed off-screen point the window is moved to when logically "hidden" —
+/// same rationale as the egui/eframe version (see `docs/architecture/window-lifecycle.md`).
 pub const OFFSCREEN_POSITION: (f32, f32) = (-8000.0, -8000.0);
-
-/// Startup layered-window priming (see docs/architecture/window-lifecycle.md).
-/// This is how long to wait after launch before invisibly warping the
-/// window to its real display position and back, consuming the "first time this
-/// window is actually composited onto a monitor after process start" moment before
-/// the real (user-triggered) reveal, so the DWM white placeholder never appears
-/// during a real reveal.
-const LAYERED_PRIME_ARM_DELAY_MS: u64 = 800;
-/// How many frames to stay invisible at the real position, giving DWM enough time to
-/// actually finish compositing.
-const LAYERED_PRIME_HOLD_FRAMES: u8 = 5;
-/// Upper bound, in frames, on how long to wait for `GetWindowRect` to confirm the
-/// move back off-screen (a safety valve). This should normally resolve in 1-2
-/// frames; the cap exists so the window can't get stuck invisible indefinitely if
-/// confirmation is never observed for some reason.
-const LAYERED_PRIME_OFFSCREEN_TIMEOUT_FRAMES: u8 = 30;
-
-/// Progress state for startup layered-window priming.
-///
-/// The core lesson baked into this state machine: when restoring opacity after the
-/// off-screen move, the code must explicitly confirm via `GetWindowRect` that the
-/// queued `ViewportCommand::OuterPosition` move has actually landed *before*
-/// restoring opacity, rather than assuming an order between it and the immediate
-/// Win32 opacity call. An earlier version sent "restore opacity" and "move
-/// off-screen" (queued, applied later by egui/winit) without that confirmation step,
-/// and hit a rare race where opacity was restored just before the position change
-/// had actually taken effect — reproducing, on real hardware, the exact flicker this
-/// priming step exists to prevent. Two operations that travel through different
-/// paths with different timing (an immediate Win32 call vs. a queued
-/// `ViewportCommand`) need an explicit confirmation between them, not an assumed
-/// order. (Purely off-screen approaches — toggling `ViewportCommand::Transparent`,
-/// re-invoking `DwmEnableBlurBehindWindow`, or a full-size off-screen-only prime —
-/// were also tried and had no effect on the real on-screen flicker, which is why
-/// priming has to actually move the window on-screen rather than manipulate it
-/// while off-screen.)
-enum LayeredPrimeState {
-    /// Waiting since startup (value is the deadline).
-    Waiting(Instant),
-    /// Just made invisible (alpha 0); next step is to move to the real position.
-    MoveOnScreen,
-    /// Counting down the frames spent invisible at the real position.
-    Hold(u8),
-    /// Just issued the move off-screen; next step is to confirm arrival via `GetWindowRect`.
-    MoveOffscreen,
-    /// Polling `GetWindowRect` for arrival off-screen (value is remaining timeout frames).
-    WaitOffscreen(u8),
-    /// Finished (no further action). Also reached if a real `set_visible(true)` cuts
-    /// priming short partway through.
-    Done,
-}
-
-/// How long `ui()` spends fade-in/scale animating, purely on the rendering side,
-/// based on elapsed time since `set_visible(true)`. Implemented via
-/// `egui::Context::set_transform_layer`, a pure post-transform on the render layer —
-/// it never touches the window's actual size/position (`OuterPosition`/`InnerSize`)
-/// or any OS-level Show/Hide transition, so it can't reintroduce the white-flash
-/// issue those transitions caused (see "Resident process & display model").
-const SHOW_ANIM_DURATION: Duration = Duration::from_millis(140);
-/// The scale the animation starts at, growing to 1.0.
-const SHOW_ANIM_SCALE_FROM: f32 = 0.92;
-
-/// Height of one dropdown-style search-result row. Used both when dynamically
-/// resizing the window (`sync_window_height`) and when drawing result rows (`ui()`),
-/// so the number of rows actually drawn always matches the window height sent to the OS.
-const RESULT_ROW_HEIGHT: f32 = 40.0;
-
-/// Cap on how many result rows are shown/sized for at once without scrolling, so the
-/// window never grows off-screen. `config.max_results` (the settings window's
-/// "maximum results shown" field) can't be set above this (see the `DragValue` range
-/// in `settings_window.rs`). Candidates beyond this cap are still kept, up to
-/// `RESULT_RETENTION_CAP`, and reachable by scrolling the `egui::ScrollArea`.
 pub(crate) const MAX_VISIBLE_ROWS: usize = 8;
-
-/// Cap on how many search results are retained for scrolling. Independent of
-/// `config.max_results` (the visible-without-scrolling count, itself capped at
-/// `MAX_VISIBLE_ROWS`) — this bounds how many fuzzy-matched candidates are kept at
-/// all. Left unbounded, sorting and drawing cost would grow without limit on every
-/// keystroke on a large index, so it's cut off at a fixed value.
 const RESULT_RETENTION_CAP: usize = 50;
-
-/// Extra window height added only while the right-click context menu
-/// (`egui::Response::context_menu`) is open. The main window is a single
-/// undecorated OS window (`with_decorations(false)`), and the menu (an
-/// `Order::Foreground` layer) can't physically render outside that window's own
-/// pixel bounds. With an empty query (window height = `MAIN_WINDOW_SIZE.1` only),
-/// right-clicking the input box would otherwise open a menu (up to 5 items + a
-/// separator) taller than the available 60px and get visibly cut off.
-/// `ctx.any_popup_open()` detects the open menu and this headroom is added only
-/// while it's open.
+const RESULT_ROW_HEIGHT: f32 = 40.0;
+const CONTENT_PADDING: f32 = 16.0;
+const PERIODIC_RESCAN_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Extra window height added only while the right-click context menu is
+/// open. The main window is a single undecorated OS window, and the menu
+/// (a `deferred`/`anchored` overlay) can't physically render outside that
+/// window's own pixel bounds. With an empty query (window height =
+/// `MAIN_WINDOW_SIZE.1` only), right-clicking the input box would otherwise
+/// open a menu (up to 5 items + a separator) taller than the available 60px
+/// and get visibly cut off. Ported from the egui/eframe version's
+/// `CONTEXT_MENU_HEADROOM` (`ctx.any_popup_open()`-gated); here it's gated
+/// on `self.context_menu.is_some()` instead.
 const CONTEXT_MENU_HEADROOM: f32 = 220.0;
 
-/// Highlight for the selected result row. Kept translucent so it blends with the
-/// `ui_chrome::glass_panel` glass background underneath (an opaque color would break
-/// the glass look).
-const RESULT_SELECTED_BG: egui::Color32 =
-    egui::Color32::from_rgba_unmultiplied_const(255, 255, 255, 24);
-/// Inner padding from the main window's left edge, used to fit
-/// `ui_chrome::glass_panel`'s rounded corner and the input box's accent bar.
-const CONTENT_PADDING: f32 = 16.0;
-/// Width reserved out of the title/subtitle display area for the `Alt+N` hint chip
-/// drawn on the right side of each result row. Sized a bit wider than the longest
-/// chip (`Alt+9`).
-const HINT_CHIP_RESERVED_WIDTH: f32 = 60.0;
+actions!(
+    issen,
+    [
+        MoveUp,
+        MoveDown,
+        Confirm,
+        RunAsAdminAction,
+        OpenLocationAction,
+        EscapeAction,
+        AltNum1,
+        AltNum2,
+        AltNum3,
+        AltNum4,
+        AltNum5,
+        AltNum6,
+        AltNum7,
+        AltNum8,
+        AltNum9,
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        SelectLeft,
+        SelectRight,
+        SelectAll,
+        Home,
+        End,
+        Paste,
+        Cut,
+        Copy,
+    ]
+);
+
+const KEY_CONTEXT: &str = "issen-search";
 
 enum ResultActionKind {
     Default,
     RunAsAdmin,
     OpenLocation,
-    CopyPath,
 }
 
-/// An action triggered by clicking a result row or its right-click menu. Deferred
-/// rather than run inside `ui()`'s results `for` loop — see `pending_row_action`'s
-/// doc comment for why.
-enum RowMenuAction {
-    Run(ResultActionKind),
-    RegisterAlias,
-    Pin,
-    Unpin,
-}
-
-pub struct IssenApp {
-    config: Config,
-    lang: Lang,
-    strings: &'static Strings,
-    query: String,
-    results: Vec<SearchResult>,
-    selected: usize,
-    /// Changed every time `run_search` runs. Used as the `egui::ScrollArea` ID salt
-    /// for the results area, so scroll position resets to the top on every new query
-    /// (relying on egui's standard "a changed ID means a fresh scroll state" behavior).
-    search_generation: u64,
-    /// Set only right after a key action (arrow keys, Alt+digit) changes `selected`.
-    /// While set, `ui()` calls `Response::scroll_to_me` on the selected row to pull a
-    /// selection that scrolled out of view back into range. Not set for mouse-click
-    /// selection (already visible, since it had to be clicked).
-    pending_scroll_to_selected: bool,
-    /// Open/closed state of the query-history panel (opened via the history icon
-    /// next to the input box). While open, `show_history_panel` draws in place of
-    /// the normal search results. Closes automatically when the query is edited
-    /// (`response.changed()`), the icon is clicked again, or the window is hidden.
-    history_panel_open: bool,
-    /// The app's *intended* visibility — whether the window is logically at its real
-    /// on-screen position or parked at `OFFSCREEN_POSITION`. Since the window is
-    /// always OS-visible (`with_visible(true)`), this does not correspond to
-    /// `IsWindowVisible` (see `set_visible`'s doc comment).
-    visible: bool,
-    /// The instant `set_visible(true)` was last called. Until `SHOW_ANIM_DURATION`
-    /// has elapsed, `ui()` uses this to drive the fade-in/scale animation (see
-    /// `SHOW_ANIM_DURATION`'s doc comment).
-    show_anim_start: Option<Instant>,
-    /// The last `config.hotkey` value actually applied to `HotkeyListener`. Guards
-    /// `update_hotkey` so it's only called when the value changes (same pattern as
-    /// `apply_language`).
-    last_hotkey_spec: String,
-    /// The last `config.font_scale` value applied to `egui::Style`. Guards
-    /// `ctx.style_mut` calls (which trigger font-atlas relayout) so they only happen
-    /// when the value actually changes.
-    applied_font_scale: f32,
-    /// The last `config.ui_font` value applied via `crate::fonts::apply_fonts`.
-    /// Guarded the same way as `applied_font_scale`, since it also rebuilds the font atlas.
-    content_height: f32,
-    /// The window height last sent to (or that should be sent to) the OS. Guards
-    /// `ViewportCommand::InnerSize` so it's only sent when the value changes (see
-    /// `sync_window_height`).
-    applied_ui_font: crate::config::UiFont,
-    hotkey: HotkeyListener,
-    tray: TrayHandle,
-    app_index: AppIndexProvider,
-    /// Persisted state for the "usage-based pinning" feature that boosts previously
-    /// chosen results back to the top (`src/history.rs`). Saved to `history.toml`,
-    /// separate from `config.toml` (see `History`'s doc comment).
-    history: crate::history::History,
-    /// Loaded once at startup from `%APPDATA%\Issen\plugins` (DLL loading has real
-    /// I/O cost, so unlike `app_index`'s background rescans, this doesn't happen on
-    /// every keystroke). Manual/periodic rescans (`start_scan`) only cover the app
-    /// index — plugins aren't reloaded (hot-reload is out of scope for now; see
-    /// docs/architecture/plugins.md).
-    plugins: PluginProvider,
-    pending_scan: Option<IndexScan>,
-    next_periodic_scan: Instant,
-    last_scan_finished: Option<Instant>,
-    last_scan_count: usize,
-    settings: SettingsWindow,
-    about_open: bool,
-    tools: crate::tools::ToolsState,
-    /// When the tray's "Settings"/"About" is clicked while the main window is
-    /// hidden, actually opening it (`settings.open()`/`about_open = true`) is
-    /// deferred by one frame — see `handle_tray_action`'s doc comment for why.
-    pending_open: Option<PendingOpen>,
-    /// Test hook: while `ISSEN_DEBUG_AUTO_CYCLE_MS` is set, repeatedly toggles
-    /// `set_visible` at a fixed interval (show -> hide -> show -> ...) without using
-    /// any real keyboard/hotkey automation. Exists so an external screen-capture
-    /// harness can mechanically trigger "bugs that only reproduce right after
-    /// showing" many times over. `(toggle interval, next toggle time)`. Has no
-    /// effect on normal operation while `None`. Not a permanent feature.
-    debug_auto_cycle: Option<(Duration, Instant)>,
-    /// Test hook: while `ISSEN_DEBUG_VISIBLE_DELAY_MS` is set, a background thread
-    /// sleeps for the given number of milliseconds after startup, then sends one
-    /// notification and calls `ctx.request_repaint()` — mimicking the same "an
-    /// external thread wakes a sleeping event loop" path `HotkeyListener` uses on a
-    /// real hotkey press. `logic()` only calls `set_visible(true)` when it actually
-    /// receives this notification via `try_recv`; the rest of the time it doesn't
-    /// call `request_repaint_after` at all, so the loop genuinely sleeps (a timed
-    /// poll entirely inside `logic()` would keep waking the loop while waiting,
-    /// which wouldn't reproduce the real hotkey path of "an external thread wakes a
-    /// sleeping loop"). Used to verify whether the first-ever reveal still flickers
-    /// even after a long delay post-launch. Resets to `None` once fired, after which
-    /// it has no further effect. Not a permanent feature.
-    debug_delayed_show: Option<std::sync::mpsc::Receiver<()>>,
-    /// The main window's HWND. Already obtained in `new()`, but kept as a field
-    /// because startup layered-window priming (`tick_layered_prime`) needs to call
-    /// raw Win32 APIs every frame from `logic()`.
-    main_hwnd: HWND,
-    /// Progress state for startup layered-window priming (see `LayeredPrimeState`).
-    layered_prime: LayeredPrimeState,
+/// What the open right-click context menu is for — the search box's own
+/// background (Settings/Reindex/Quit) or a specific result row (index into
+/// `IssenApp::results` at the time it was opened).
+#[derive(Clone, Copy)]
+enum ContextMenuTarget {
+    Main,
+    Row(usize),
 }
 
 #[derive(Clone, Copy)]
-enum PendingOpen {
-    Settings,
-    About,
+struct OpenContextMenu {
+    target: ContextMenuTarget,
+    /// Window-space position the menu is anchored to (from the opening
+    /// `MouseDownEvent::position`).
+    position: Point<Pixels>,
+}
+
+pub struct IssenApp {
+    pub(crate) config: Config,
+    lang: Lang,
+    pub(crate) strings: &'static Strings,
+
+    // Search box text-input state (see `EntityInputHandler` impl below).
+    focus_handle: FocusHandle,
+    query: SharedString,
+    selected_range: Range<usize>,
+    selection_reversed: bool,
+    marked_range: Option<Range<usize>>,
+    last_layout: Option<ShapedLine>,
+    last_bounds: Option<Bounds<Pixels>>,
+    is_selecting: bool,
+
+    results: Vec<SearchResult>,
+    selected: usize,
+    /// The window's current content height, guarding `Window::resize` so it's
+    /// only called when the value actually changes (same pattern as the
+    /// egui/eframe version's `set_window_height`).
+    content_height: f32,
+
+    visible: bool,
+    /// Set `false` on every `show()`, `true` the first time this window is
+    /// actually observed OS-active afterward. Guards the focus-loss auto-hide
+    /// (`new`'s `observe_window_activation`) against a real race: `show()`
+    /// requests OS activation asynchronously (`Window::activate_window`,
+    /// dispatched via an executor task), so if Windows denies the foreground
+    /// steal, a deactivation could arrive while `visible` is already `true`
+    /// but this window was never actually the active one — without this
+    /// guard, that would immediately hide the window it just showed.
+    seen_active_since_show: bool,
+    /// Set for the duration of a synchronous call into `settings_window::
+    /// open`/`tools::open`/`about_window::open`. Those functions' `Option<
+    /// WindowHandle<_>>` output field is only assigned *after* `cx.
+    /// open_window` returns, but per gotcha #3 in the migration notes,
+    /// `cx.open_window` runs the new window's first render (and can trigger
+    /// this window's deactivation) synchronously, inside that same call —
+    /// during which `has_open_secondary_window`'s entity-based check would
+    /// still see `None` and hide this window out from under the one that's
+    /// opening. This flag covers exactly that window.
+    opening_secondary_window: bool,
+
+    /// The query-history list (🕘 icon next to the input box). While open,
+    /// it's drawn in place of the normal result list, and keyboard shortcuts
+    /// that act on `results` (up/down, Enter, Alt+digit) are suspended —
+    /// `results` stays stale from the last real search while this is open.
+    history_panel_open: bool,
+    /// Shared by the result list and the query-history panel (only one is
+    /// ever shown at a time). Rows beyond `visible_rows_cap()` are still
+    /// rendered — the window itself only grows to fit `visible_rows_cap`
+    /// rows tall — so this is what makes the rest reachable, via mouse
+    /// wheel or keyboard nav (`scroll_to_item`, see `move_up`/`move_down`).
+    /// Reset to the top on every new search and on opening/closing the
+    /// history panel, since it's switching to a different list.
+    scroll_handle: ScrollHandle,
+    /// The open right-click context menu, if any (search box background or
+    /// a result row). GPUI core has no `context_menu` widget, so this is a
+    /// custom `anchored()`/`deferred()` overlay drawn in `render()`.
+    context_menu: Option<OpenContextMenu>,
+
+    // Kept alive so its listener thread (and the global hotkey registration
+    // it holds) isn't torn down. `update_hotkey` is called live from the
+    // settings window's hotkey field (`settings_window.rs`).
+    pub(crate) hotkey: HotkeyListener,
+    pub(crate) tray: TrayHandle,
+    about_window: Option<WindowHandle<AboutWindow>>,
+    settings_window: Option<WindowHandle<crate::settings_window::SettingsWindow>>,
+    tools_window: Option<WindowHandle<ToolsWindow>>,
+    app_index: AppIndexProvider,
+    history: crate::history::History,
+    plugins: PluginProvider,
+    pub(crate) scanning: bool,
+    pub(crate) last_scan_finished: Option<Instant>,
+    pub(crate) last_scan_count: usize,
+
+    main_hwnd: HWND,
 }
 
 impl IssenApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
-        let main_hwnd = window_hwnd(cc).expect("failed to obtain main window HWND");
-        // Exclude from Alt+Tab (needed once the window became permanently OS-visible;
-        // see `with_taskbar(false)`'s doc comment in `main.rs`). `with_taskbar(false)`
-        // only removes the taskbar entry, not the Alt+Tab entry, so the extended
-        // window style is set directly here.
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        config: Config,
+        hotkey: HotkeyListener,
+        tray: TrayHandle,
+    ) -> Self {
+        let main_hwnd = window_hwnd(window).expect("failed to obtain main window HWND");
         set_tool_window_style(main_hwnd);
-
-        // eframe's bundled fonts have no CJK glyphs, so Windows-bundled fonts are
-        // added as a fallback to render Japanese app names in search results and
-        // Japanese UI strings.
-        crate::fonts::apply_fonts(&cc.egui_ctx, config.ui_font);
-        apply_theme(&cc.egui_ctx, config.theme);
+        // `WindowOptions.window_bounds`'s origin/size aren't reliably honored
+        // when the window is created off-screen at a large negative origin
+        // (observed on real hardware: the window came up full-monitor-width
+        // and on-screen instead of at `OFFSCREEN_POSITION`/`MAIN_WINDOW_SIZE`).
+        // Force both explicitly via the same raw Win32 calls `hide` uses,
+        // rather than trusting `WindowOptions` for the off-screen case.
+        window.resize(size(px(MAIN_WINDOW_SIZE.0), px(MAIN_WINDOW_SIZE.1)));
+        move_window(
+            main_hwnd,
+            OFFSCREEN_POSITION.0 as i32,
+            OFFSCREEN_POSITION.1 as i32,
+        );
 
         let lang = i18n::resolve(config.language);
         let strings = Strings::for_lang(lang);
 
-        let hotkey = HotkeyListener::spawn(cc.egui_ctx.clone(), config.hotkey.clone());
-        let last_hotkey_spec = config.hotkey.clone();
-        let tray = TrayHandle::new(&cc.egui_ctx, strings).expect("failed to create tray icon");
-        let pending_scan = IndexScan::spawn(ScanConfig::from_config(&config));
-        if pending_scan.is_some() {
-            tray.set_scanning(strings, true);
-        }
-
-        // Hidden windows and secondary viewports are hard to verify via normal
-        // screenshot-based testing, so debug environment variables control startup
-        // state for that purpose (unset by default = normal behavior).
-        let mut settings = SettingsWindow::new(&config);
-        let mut about_open = false;
-        if std::env::var_os("ISSEN_DEBUG_OPEN_SETTINGS").is_some() {
-            settings.open();
-        }
-        if std::env::var_os("ISSEN_DEBUG_OPEN_ABOUT").is_some() {
-            about_open = true;
-        }
-        let mut tools = crate::tools::ToolsState::default();
-        match std::env::var("ISSEN_DEBUG_OPEN_TOOL").as_deref() {
-            Ok("color-picker") => tools.toggle(crate::tools::ToolKind::ColorPicker),
-            Ok("unit-converter") => tools.toggle(crate::tools::ToolKind::UnitConverter),
-            _ => {}
-        }
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window, cx);
 
         let mut app = Self {
-            strings,
             lang,
-            query: String::new(),
+            strings,
+            focus_handle,
+            query: SharedString::default(),
+            selected_range: 0..0,
+            selection_reversed: false,
+            marked_range: None,
+            last_layout: None,
+            last_bounds: None,
+            is_selecting: false,
             results: Vec::new(),
             selected: 0,
-            search_generation: 0,
-            pending_scroll_to_selected: false,
-            history_panel_open: false,
-            // Initial visibility from the `ISSEN_DEBUG_VISIBLE` debug variable is
-            // applied by starting `false` here and calling `set_visible(true)` after
-            // construction (below), so it correctly passes through `set_visible`'s
-            // "only send a command when the value changes" guard.
-            visible: false,
-            show_anim_start: None,
             content_height: MAIN_WINDOW_SIZE.1,
-            last_hotkey_spec,
-            // `NAN` never compares `< EPSILON` against any value, so it acts as a
-            // sentinel that guarantees `apply_font_scale`'s diff guard always passes
-            // through on the very first call after startup. (If `config.toml` has a
-            // saved `font_scale` other than `1.0`, initializing this field to
-            // `config.font_scale` directly would make the startup guard see "no
-            // change" and skip applying the scale, leaving the UI at the default size.)
-            applied_font_scale: f32::NAN,
-            // Unlike `applied_font_scale`'s NAN sentinel, this starts as
-            // `config.ui_font` itself, since the `apply_fonts` call at the top of
-            // `new()` has already applied it — the initial value can correctly
-            // reflect "already applied" here.
-            applied_ui_font: config.ui_font,
+            visible: false,
+            seen_active_since_show: false,
+            opening_secondary_window: false,
+            history_panel_open: false,
+            scroll_handle: ScrollHandle::new(),
+            context_menu: None,
             hotkey,
             tray,
+            about_window: None,
+            settings_window: None,
+            tools_window: None,
             app_index: AppIndexProvider::empty(),
             history: crate::history::History::load_or_default(config::APP_NAME),
             plugins: PluginProvider::load_from_app_data(),
-            pending_scan,
-            next_periodic_scan: Instant::now() + PERIODIC_RESCAN_INTERVAL,
+            scanning: false,
             last_scan_finished: None,
             last_scan_count: 0,
-            settings,
-            about_open,
-            tools,
-            pending_open: None,
-            config,
-            debug_auto_cycle: std::env::var("ISSEN_DEBUG_AUTO_CYCLE_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|ms| {
-                    let interval = Duration::from_millis(ms);
-                    (interval, Instant::now() + interval)
-                }),
-            debug_delayed_show: std::env::var("ISSEN_DEBUG_VISIBLE_DELAY_MS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|ms| {
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    let ctx = cc.egui_ctx.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(Duration::from_millis(ms));
-                        let _ = tx.send(());
-                        ctx.request_repaint();
-                    });
-                    rx
-                }),
             main_hwnd,
-            // While `ISSEN_DEBUG_NO_LAYERED_PRIME` (test-only) is set, priming itself
-            // is skipped entirely — used to record a control group when comparing
-            // against other rejected mitigations.
-            layered_prime: if std::env::var_os("ISSEN_DEBUG_NO_LAYERED_PRIME").is_some() {
-                LayeredPrimeState::Done
-            } else {
-                LayeredPrimeState::Waiting(
-                    Instant::now() + Duration::from_millis(LAYERED_PRIME_ARM_DELAY_MS),
-                )
-            },
+            config,
         };
-        if let Ok(q) = std::env::var("ISSEN_DEBUG_QUERY") {
-            app.query = q;
-            app.run_search();
-        }
-        if std::env::var_os("ISSEN_DEBUG_VISIBLE").is_some() {
-            app.set_visible(&cc.egui_ctx, true);
-        }
+        app.start_scan(cx);
+        Self::start_periodic_rescan_loop(cx);
+
+        // Matches the egui/eframe version's `WindowFocused(false)` handling:
+        // losing OS focus hides the window, unless a secondary window (about/
+        // settings/tools) is why focus moved — those are opened *over* the
+        // main window and shouldn't cause it to vanish out from under them.
+        // `cx.observe_window_activation` fires on both activate and
+        // deactivate, so the `is_window_active()` check picks out the
+        // deactivate case; `.detach()` keeps the subscription alive for the
+        // window's lifetime (see `settings_window.rs` for the same pattern).
+        cx.observe_window_activation(window, |this, window, cx| {
+            let active = window.is_window_active();
+            let had_seen = this.seen_active_since_show;
+            if active {
+                this.seen_active_since_show = true;
+                focus_trace(format_args!(
+                    "observer: active=true had_seen={had_seen} -> seen=true"
+                ));
+                return;
+            }
+            let has_secondary = this.has_open_secondary_window(cx);
+            let will_hide = had_seen && !has_secondary;
+            focus_trace(format_args!(
+                "observer: active=false had_seen={had_seen} has_secondary={has_secondary} fg={} thread_active={} -> {}",
+                window_is_foreground(this.main_hwnd),
+                window_is_thread_active(this.main_hwnd),
+                if will_hide {
+                    "hide"
+                } else if !had_seen {
+                    "skip(not-seen)"
+                } else {
+                    "skip(secondary-open)"
+                }
+            ));
+            if will_hide {
+                this.hide(window, cx);
+            }
+        })
+        .detach();
+
         app
+    }
+
+    /// Whether the about/settings/tools window is currently open (or in the
+    /// middle of opening — see `opening_secondary_window`'s doc comment).
+    /// Those `Option<WindowHandle<_>>` fields are never cleared back to
+    /// `None` when the user closes the window via its own close button (only
+    /// when this app itself replaces/reopens it), so `.is_some()` alone would
+    /// still see a stale, already-closed handle as "open" — `entity(cx)`
+    /// fails once the underlying OS window is actually gone.
+    fn has_open_secondary_window(&self, cx: &Context<Self>) -> bool {
+        fn is_open<V: Render>(handle: &Option<WindowHandle<V>>, cx: &Context<IssenApp>) -> bool {
+            handle.as_ref().is_some_and(|h| h.entity(cx).is_ok())
+        }
+        self.opening_secondary_window
+            || is_open(&self.about_window, cx)
+            || is_open(&self.settings_window, cx)
+            || is_open(&self.tools_window, cx)
     }
 
     fn run_search(&mut self) {
@@ -400,9 +352,6 @@ impl IssenApp {
             results.extend(EverythingProvider.search(&self.query));
         }
         results.extend(self.plugins.search(&self.query));
-        // Usage-based pinning: just adds a large boost (`HISTORY_SCORE_BOOST`) to the
-        // cross-provider fuzzy score, so a candidate the query no longer matches
-        // (and so isn't in `results` at all) is never force-surfaced.
         for r in &mut results {
             if let Some(boost) = self
                 .history
@@ -416,51 +365,127 @@ impl IssenApp {
 
         self.results = results;
         self.selected = 0;
-        // Bump the scroll area's ID on every query change so a new query always
-        // starts scrolled to the top rather than inheriting the previous manual
-        // scroll position (see `ScrollArea::id_salt` in `ui()`).
-        self.search_generation = self.search_generation.wrapping_add(1);
+        self.scroll_handle.set_offset(Point::default());
     }
 
-    /// Entry point for both manual and periodic rescans. No-op if a scan is already
-    /// running (prevents overlapping scans).
-    fn start_scan(&mut self) {
-        if self.pending_scan.is_some() {
+    /// Entry point for both the initial startup scan and a manual reindex
+    /// (including from the settings window — a separate GPUI `Window`, so
+    /// this deliberately doesn't take `&mut Window` itself; see below).
+    /// No-op if a scan is already running. Unlike the egui/eframe version's
+    /// `poll_scan` (called every frame from `logic()`), completion is
+    /// awaited by a `cx.spawn` task that blocks on the scan's channel from a
+    /// background executor thread and wakes this view once — no polling.
+    pub(crate) fn start_scan(&mut self, cx: &mut Context<Self>) {
+        if self.scanning {
             return;
         }
-        self.pending_scan = IndexScan::spawn(ScanConfig::from_config(&self.config));
-        if self.pending_scan.is_some() {
-            self.tray.set_scanning(self.strings, true);
-        }
-    }
-
-    fn poll_scan(&mut self) {
-        let Some(scan) = &self.pending_scan else {
+        let Some(scan) = IndexScan::spawn(ScanConfig::from_config(&self.config)) else {
             return;
         };
-        if let Some(provider) = scan.try_recv() {
-            self.last_scan_count = provider.len();
-            self.last_scan_finished = Some(Instant::now());
-            self.app_index = provider;
-            self.pending_scan = None;
-            self.tray.set_scanning(self.strings, false);
-            self.next_periodic_scan = Instant::now() + PERIODIC_RESCAN_INTERVAL;
-            if !self.query.is_empty() {
-                self.run_search();
+        self.scanning = true;
+        self.tray.set_scanning(self.strings, true);
+
+        // `Context::spawn` (unlike `App::spawn`) hands the async closure a
+        // `WeakEntity<Self>`, used to get back into this view once the scan
+        // finishes — no `&mut Window` needed for that (`on_scan_finished`
+        // doesn't touch the window), which is what lets a *different*
+        // window's event handler (settings' Rescan button) call this.
+        cx.spawn(async move |this, cx| {
+            let receiver = scan.into_receiver();
+            let provider = cx
+                .background_executor()
+                .spawn(async move { receiver.recv().ok() })
+                .await;
+            if let Some(provider) = provider {
+                let _ = this.update(cx, |view, cx| {
+                    view.on_scan_finished(provider, cx);
+                });
             }
-        }
+        })
+        .detach();
     }
 
-    fn run_result_action(&mut self, ctx: &egui::Context, kind: ResultActionKind) {
+    /// Wakes `start_scan` every `PERIODIC_RESCAN_INTERVAL`, without a
+    /// per-frame poll — same underlying `cx.background_executor().timer`
+    /// pattern as the tools window's eyedropper (`tools/mod.rs::
+    /// start_eyedropper`/`poll_eyedropper`). Started once from `new`;
+    /// detached, so it runs for the app's whole lifetime.
+    ///
+    /// Deliberately a flat "sleep, then fire" loop rather than tracking a
+    /// shared `next_periodic_scan`-style deadline field that `on_scan_
+    /// finished` also writes to reset the clock after a manual rescan: an
+    /// earlier version tried that and raced with itself on real hardware —
+    /// `start_scan` only *starts* a scan and returns immediately, so a
+    /// deadline read right after firing was still stale (not yet pushed
+    /// forward by the in-flight scan's own completion), producing a second,
+    /// spurious near-immediate fire every cycle. `start_scan`'s own
+    /// `self.scanning` guard already prevents overlapping scans, which is
+    /// all this loop actually needs — the cost of not resetting on a manual
+    /// rescan is at most one redundant (harmless, no-op-if-still-scanning)
+    /// extra scan near the boundary, which is far cheaper than the race.
+    fn start_periodic_rescan_loop(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(PERIODIC_RESCAN_INTERVAL)
+                .await;
+            let Ok(()) = this.update(cx, |view, cx| view.start_scan(cx)) else {
+                break;
+            };
+        })
+        .detach();
+    }
+
+    fn on_scan_finished(&mut self, provider: AppIndexProvider, cx: &mut Context<Self>) {
+        self.last_scan_count = provider.len();
+        self.last_scan_finished = Some(Instant::now());
+        self.app_index = provider;
+        self.scanning = false;
+        self.tray.set_scanning(self.strings, false);
+        if !self.query.is_empty() {
+            self.run_search();
+        }
+        cx.notify();
+    }
+
+    /// Rebuilds runtime state that depends on `config.language` (display
+    /// strings, tray icon) when it changes. Called directly from the
+    /// settings window's language row on click — unlike the egui/eframe
+    /// version's `apply_language` (called unconditionally every frame),
+    /// there's no per-frame polling here, so this only needs to run once
+    /// per actual change, at the point the change happens.
+    pub(crate) fn apply_language(&mut self, cx: &mut Context<Self>) {
+        let lang = i18n::resolve(self.config.language);
+        if lang == self.lang {
+            cx.notify();
+            return;
+        }
+        self.lang = lang;
+        self.strings = Strings::for_lang(lang);
+        // Keep the existing tray icon if rebuilding fails (its labels stay
+        // in the old language, but that's better than crashing the app).
+        if let Some(tray) = TrayHandle::new(self.strings) {
+            self.tray = tray;
+            if self.scanning {
+                self.tray.set_scanning(self.strings, true);
+            }
+        } else {
+            eprintln!("issen: failed to rebuild tray icon after language change; keeping old one");
+        }
+        cx.notify();
+    }
+
+    fn run_result_action(
+        &mut self,
+        kind: ResultActionKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(result) = self.results.get(self.selected) else {
             return;
         };
 
         match kind {
             ResultActionKind::Default => {
-                // Clipboard-copy results (calculator, snippets, and other plugin
-                // results) are entirely query-dependent, one-off values, so they're
-                // excluded from pinning history.
                 let history_key = (!matches!(result.action, Action::CopyToClipboard(_)))
                     .then(|| crate::search::target_key(&result.action));
                 let ok = match &result.action {
@@ -477,9 +502,6 @@ impl IssenApp {
                         self.history.record_use(&key);
                         history_dirty = true;
                     }
-                    // Query-string history (the list reachable via the history icon
-                    // next to the input box, for re-running a past search). Must be
-                    // recorded here, before `set_visible` clears `self.query`.
                     if !self.query.trim().is_empty() {
                         self.history.record_query(&self.query);
                         history_dirty = true;
@@ -489,253 +511,169 @@ impl IssenApp {
                             eprintln!("issen: failed to save history.toml: {err}");
                         }
                     }
-                    self.set_visible(ctx, false);
+                    self.hide(window, cx);
                 }
             }
             ResultActionKind::RunAsAdmin => {
                 if let Action::Launch { path, args } = &result.action {
                     if crate::launch::open_elevated(&path.display().to_string(), args) {
-                        self.set_visible(ctx, false);
+                        self.hide(window, cx);
                     }
                 }
             }
             ResultActionKind::OpenLocation => {
                 if let Action::Launch { path, .. } = &result.action {
                     crate::launch::open_containing_folder(path);
-                    self.set_visible(ctx, false);
-                }
-            }
-            ResultActionKind::CopyPath => {
-                if let Action::Launch { path, .. } = &result.action {
-                    crate::launch::copy_to_clipboard(&path.display().to_string());
+                    self.hide(window, cx);
                 }
             }
         }
     }
 
-    /// The single entry point for toggling window visibility. Sends its OS command
-    /// immediately when called, so it takes effect reliably regardless of whether
-    /// `logic()` or `ui()` (including a mouse click) triggered it. (An earlier
-    /// version compared the value at the start and end of a frame and sent a command
-    /// only if it differed — a change made in `ui()` or late in `logic()` could miss
-    /// that comparison window, leaving the window visible when it should have hidden,
-    /// most noticeably when a launch succeeded without the window ever losing focus.)
-    ///
-    /// **Never uses OS-level Show/Hide** (see `with_visible(true)`'s doc comment in
-    /// `main.rs`). The main window stays OS-visible at all times; visibility is
-    /// represented by moving it, via `OuterPosition`, between its real on-screen
-    /// position and `OFFSCREEN_POSITION` (outside every monitor's bounds).
-    /// `ViewportCommand::Visible` is never sent.
-    fn set_visible(&mut self, ctx: &egui::Context, visible: bool) {
-        if self.visible == visible {
+    /// Moves the window to its real on-screen position and focuses it. See
+    /// `hide`'s doc comment for why the window is moved rather than
+    /// shown/hidden at the OS level.
+    fn show(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible {
             return;
         }
-        self.visible = visible;
-        if visible {
-            // If startup layered-window priming (see `LayeredPrimeState`) is
-            // mid-flight (window currently invisible), a real show request takes
-            // priority and restores opacity immediately. It's harmless if priming's
-            // remaining steps (e.g. a queued position move) get overwritten after this.
-            self.finish_layered_prime_immediately();
-            // Start of `ui()`'s fade-in/scale animation (`SHOW_ANIM_DURATION`). While
-            // `ISSEN_DEBUG_NO_SHOW_ANIM` is set, the animation itself doesn't start
-            // (`ui()` always takes the same branch as the non-animated case) — used
-            // to isolate whether a visual glitch comes from the animation code
-            // (`set_transform_layer`/`set_opacity`) itself or from the
-            // off-screen/on-screen position-swap trick. Test-only, not a permanent feature.
-            if std::env::var_os("ISSEN_DEBUG_NO_SHOW_ANIM").is_none() {
-                self.show_anim_start = Some(Instant::now());
-            }
-            // In case an OS call like cursor-position lookup fails, always fall back
-            // through primary display -> a fixed coordinate, so showing always lands
-            // somewhere on-screen. (Sending only `Focus` while still at
-            // `OFFSCREEN_POSITION` would leave an invisible window off-screen that
-            // silently steals keyboard focus — once "show" is decided, the window
-            // must always move on-screen.) If `ISSEN_DEBUG_FORCE_MONITOR_POINT`
-            // (`"x,y"`, test-only) is set, target whichever display that point falls
-            // on regardless of the actual cursor position — lets a screen-capture
-            // test predict coordinates in advance.
-            let target = self.resolve_show_target();
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                target.0, target.1,
-            )));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-        } else {
-            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                OFFSCREEN_POSITION.0,
-                OFFSCREEN_POSITION.1,
-            )));
-            // The next show's `OuterPosition` is always computed relative to
-            // `MAIN_WINDOW_SIZE` (the zero-results height) — see the
-            // `position_on_*_monitor` call sites. Leaving the window at whatever
-            // height it grew to from search results would break that assumption, so
-            // the search state is folded away along with hiding.
-            self.query.clear();
-            self.results.clear();
-            self.selected = 0;
-            self.history_panel_open = false;
-            self.set_window_height(ctx, MAIN_WINDOW_SIZE.1);
-        }
+        self.visible = true;
+        // `hide()` never relinquishes OS foreground (`SWP_NOACTIVATE` on its
+        // `move_window` call — see its doc comment), so if nothing else took
+        // foreground while this window sat parked offscreen since the last
+        // cycle, it's *already* the OS-active window here. In that case the
+        // `activate_window()` call below is a no-op transition and never
+        // fires `WM_ACTIVATE(true)`, which would otherwise leave
+        // `seen_active_since_show` stuck at `false` for this whole cycle —
+        // permanently disabling the focus-loss auto-hide below (its
+        // deactivation guard never sees the "was active" flag it's waiting
+        // for). Seed it directly from the real OS state instead of only
+        // ever setting it from an activation event that, in this specific
+        // case, will never arrive.
+        self.seen_active_since_show = window_is_foreground(self.main_hwnd);
+        focus_trace(format_args!(
+            "show: fg={} thread_active={} -> seed_seen_active={}",
+            self.seen_active_since_show,
+            window_is_thread_active(self.main_hwnd),
+            self.seen_active_since_show
+        ));
+        let target = self.resolve_show_target();
+        move_window(self.main_hwnd, target.0 as i32, target.1 as i32);
+        // `hide()` skips this on its own way out (see `sync_window_height`'s
+        // doc comment) precisely so this call is the one that actually
+        // shrinks the window back down — deterministically, before anything
+        // is visible, rather than waiting for the next incidental re-render.
+        self.sync_window_height(window);
+        // `window.focus` only moves GPUI's own internal notion of which view
+        // has keyboard focus — it doesn't ask Windows for OS-level input
+        // focus. Without `activate_window()` (raw `SetForegroundWindow`/
+        // `SetActiveWindow`/`SetFocus`, see `gpui_windows`'s `activate`),
+        // keystrokes typed right after a hotkey press went nowhere until the
+        // user clicked the window once. Matches the egui/eframe version's
+        // `ViewportCommand::Focus` on the same call site.
+        window.activate_window();
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
     }
 
-    /// Computes where on the target display the window should go. Both
-    /// `set_visible(true)` and startup layered-window priming
-    /// (`tick_layered_prime`'s `MoveOnScreen` step) need "where would we show right
-    /// now" computed by the same logic, hence this shared function.
+    /// **Never uses OS-level Show/Hide.** Same rationale as the egui/eframe
+    /// version (`docs/architecture/window-lifecycle.md`): the window stays
+    /// OS-visible at all times, and "hidden" is represented purely by
+    /// parking it at `OFFSCREEN_POSITION` via a raw `SetWindowPos` call.
+    #[track_caller]
+    fn hide(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let caller = std::panic::Location::caller();
+        if !self.visible {
+            focus_trace(format_args!("hide: already hidden, no-op (from {caller})"));
+            return;
+        }
+        focus_trace(format_args!("hide: hiding (from {caller})"));
+        self.visible = false;
+        move_window(
+            self.main_hwnd,
+            OFFSCREEN_POSITION.0 as i32,
+            OFFSCREEN_POSITION.1 as i32,
+        );
+        self.query = SharedString::default();
+        self.selected_range = 0..0;
+        self.marked_range = None;
+        self.results.clear();
+        self.selected = 0;
+        self.history_panel_open = false;
+        self.context_menu = None;
+        self.sync_window_height(window);
+        cx.notify();
+    }
+
     fn resolve_show_target(&self) -> (f32, f32) {
-        // Falls back through primary display -> a fixed coordinate in case an OS
-        // call like cursor-position lookup fails. If
-        // `ISSEN_DEBUG_FORCE_MONITOR_POINT` (`"x,y"`, test-only) is set, targets
-        // whichever display that point falls on regardless of the actual cursor
-        // position, so a screen-capture test can predict coordinates in advance.
-        let forced_point = std::env::var("ISSEN_DEBUG_FORCE_MONITOR_POINT")
-            .ok()
-            .and_then(|s| {
-                let (x, y) = s.split_once(',')?;
-                Some((x.trim().parse::<i32>().ok()?, y.trim().parse::<i32>().ok()?))
-            });
-        if let Some(point) = forced_point {
-            crate::display::position_on_point_monitor(point, MAIN_WINDOW_SIZE)
-        } else {
-            match self.config.display_target {
-                config::DisplayTarget::Cursor => {
-                    crate::display::position_on_cursor_monitor(MAIN_WINDOW_SIZE)
-                }
-                config::DisplayTarget::Primary => {
-                    crate::display::position_on_primary_monitor(MAIN_WINDOW_SIZE)
-                }
-                config::DisplayTarget::FocusedWindow => {
-                    crate::display::position_on_foreground_window_monitor(MAIN_WINDOW_SIZE)
-                }
+        match self.config.display_target {
+            config::DisplayTarget::Cursor => {
+                crate::display::position_on_cursor_monitor(MAIN_WINDOW_SIZE)
+            }
+            config::DisplayTarget::Primary => {
+                crate::display::position_on_primary_monitor(MAIN_WINDOW_SIZE)
+            }
+            config::DisplayTarget::FocusedWindow => {
+                crate::display::position_on_foreground_window_monitor(MAIN_WINDOW_SIZE)
             }
         }
         .or_else(|| crate::display::position_on_primary_monitor(MAIN_WINDOW_SIZE))
         .unwrap_or((100.0, 100.0))
     }
 
-    /// Cuts short whatever's left of startup layered-window priming (see
-    /// `LayeredPrimeState`) and immediately restores full opacity (alpha 255). An
-    /// escape hatch preventing the window from staying invisible if a real show
-    /// request (`set_visible(true)`) interrupts priming mid-flight. No-op if
-    /// priming has already finished (`Done`).
-    fn finish_layered_prime_immediately(&mut self) {
-        if !matches!(self.layered_prime, LayeredPrimeState::Done) {
-            exit_layered(self.main_hwnd);
-            self.layered_prime = LayeredPrimeState::Done;
+    /// Syncs the window's actual OS height to the current result count (or,
+    /// while the history panel is open, the query-history row count — even
+    /// with zero history entries, one row ("no history yet") is still
+    /// drawn, hence `max(1)`). Adds `CONTEXT_MENU_HEADROOM` while the
+    /// right-click context menu is open, so it doesn't get cut off. Safe to
+    /// call every frame (`Window::resize` is only invoked when the value
+    /// changes).
+    ///
+    /// **No-ops while hidden.** `gpui_windows`'s `resize()` calls
+    /// `SetWindowPos` without `SWP_NOACTIVATE` (confirmed in the vendored
+    /// `zed-industries/zed` checkout, `crates/gpui_windows/src/window.rs`),
+    /// so it silently reclaims this window as the OS thread's active window
+    /// — even while it's parked off-screen. `hide()` calls this right after
+    /// clearing `results`, which used to trigger exactly that: a spurious
+    /// `WM_ACTIVATE(true)` moments after a real focus-loss deactivation,
+    /// leaving `GetActiveWindow()` pointing at this window again. The next
+    /// `show()` would then see a stale "already active" thread state, making
+    /// its own `activate_window()` a no-op that never fires a real
+    /// `WM_ACTIVATE(true)` — so `seen_active_since_show` stuck at `false`
+    /// for that whole cycle, silently disabling the focus-loss auto-hide
+    /// until the user manually clicked the window once (confirmed via
+    /// `ISSEN_DEBUG_FOCUS_TRACE` real-hotkey tracing, 2026-09-08). Skipping
+    /// the resize while hidden is harmless — the window isn't on-screen for
+    /// its size to matter — and `show()` calls this again before activating,
+    /// so the size is always correct by the time it's visible.
+    fn sync_window_height(&mut self, window: &mut Window) {
+        if !self.visible {
+            return;
         }
-    }
-
-    /// Advances startup layered-window priming by one frame. Called every frame from
-    /// `logic()` (a no-op, immediate return, once `LayeredPrimeState::Done` — no
-    /// effect on normal operation at that point).
-    fn tick_layered_prime(&mut self, ctx: &egui::Context) {
-        match self.layered_prime {
-            LayeredPrimeState::Done => {}
-            LayeredPrimeState::Waiting(deadline) => {
-                if Instant::now() >= deadline {
-                    // Go invisible before moving the position. With this order, the
-                    // window stays invisible the whole time until the `MoveOnScreen`
-                    // move to the real position is actually processed — the worst
-                    // case if that's delayed is simply "sits invisible at the old
-                    // (off-screen) position a little longer," which is visually a no-op.
-                    enter_layered_invisible(self.main_hwnd);
-                    self.layered_prime = LayeredPrimeState::MoveOnScreen;
-                }
-                ctx.request_repaint_after(Duration::from_millis(16));
-            }
-            LayeredPrimeState::MoveOnScreen => {
-                // Test-only hook: if `ISSEN_DEBUG_FORCE_PRIME_POINT` (`"x,y"`) is set,
-                // redirect only the priming warp target there. `resolve_show_target()`
-                // is shared with the real (user-facing) show target, so
-                // `ISSEN_DEBUG_FORCE_MONITOR_POINT` alone can't put the priming target
-                // and the real show target on different monitors. This hook made that
-                // A/B test possible; pinning the priming target to a different
-                // monitor than the real show target did not reproduce the white
-                // flicker there either, disconfirming a "each monitor has its own
-                // independent first composite" hypothesis. Falls back to
-                // `resolve_show_target()` when unset (no effect on real behavior).
-                // Kept permanently for future regression testing, same as the other
-                // `ISSEN_DEBUG_*` hooks.
-                let target = std::env::var("ISSEN_DEBUG_FORCE_PRIME_POINT")
-                    .ok()
-                    .and_then(|s| {
-                        let (x, y) = s.split_once(',')?;
-                        Some((x.trim().parse::<i32>().ok()?, y.trim().parse::<i32>().ok()?))
-                    })
-                    .and_then(|point| {
-                        crate::display::position_on_point_monitor(point, MAIN_WINDOW_SIZE)
-                    })
-                    .unwrap_or_else(|| self.resolve_show_target());
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                    target.0, target.1,
-                )));
-                self.layered_prime = LayeredPrimeState::Hold(LAYERED_PRIME_HOLD_FRAMES);
-                ctx.request_repaint();
-            }
-            LayeredPrimeState::Hold(remaining) => {
-                if let Some(next) = remaining.checked_sub(1) {
-                    self.layered_prime = LayeredPrimeState::Hold(next);
-                } else {
-                    self.layered_prime = LayeredPrimeState::MoveOffscreen;
-                }
-                ctx.request_repaint();
-            }
-            LayeredPrimeState::MoveOffscreen => {
-                // The critical ordering: send "move off-screen" before restoring
-                // opacity, and only actually restore opacity in the next state
-                // (`WaitOffscreen`) once arrival is confirmed. This avoids ever
-                // exposing full opacity on-screen between the two operations.
-                ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
-                    OFFSCREEN_POSITION.0,
-                    OFFSCREEN_POSITION.1,
-                )));
-                self.layered_prime =
-                    LayeredPrimeState::WaitOffscreen(LAYERED_PRIME_OFFSCREEN_TIMEOUT_FRAMES);
-                ctx.request_repaint();
-            }
-            LayeredPrimeState::WaitOffscreen(remaining) => {
-                if window_is_offscreen(self.main_hwnd) {
-                    exit_layered(self.main_hwnd);
-                    self.layered_prime = LayeredPrimeState::Done;
-                } else if let Some(next) = remaining.checked_sub(1) {
-                    self.layered_prime = LayeredPrimeState::WaitOffscreen(next);
-                    ctx.request_repaint();
-                } else {
-                    // Safety valve: if arrival off-screen still can't be confirmed
-                    // within the expected number of frames, restoring opacity is
-                    // preferred over leaving the window invisible indefinitely.
-                    exit_layered(self.main_hwnd);
-                    self.layered_prime = LayeredPrimeState::Done;
-                }
-            }
+        let mut height = MAIN_WINDOW_SIZE.1 + self.visible_row_count() as f32 * RESULT_ROW_HEIGHT;
+        if self.context_menu.is_some() {
+            height += CONTEXT_MENU_HEADROOM;
         }
-    }
-
-    /// The single entry point for sending the window's actual height to the OS, only
-    /// when it changes (same "send only on change" guard pattern as `set_visible`).
-    /// Used to grow/shrink the window downward, dropdown-style, as results change.
-    fn set_window_height(&mut self, ctx: &egui::Context, height: f32) {
         if (self.content_height - height).abs() < f32::EPSILON {
             return;
         }
         self.content_height = height;
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            MAIN_WINDOW_SIZE.0,
-            height,
-        )));
+        window.resize(size(px(MAIN_WINDOW_SIZE.0), px(height)));
     }
 
-    /// Syncs window height to the current result count. Safe to call every frame
-    /// from `ui()` (`set_window_height` only sends a command when the value
-    /// changes). Adds `CONTEXT_MENU_HEADROOM` while the right-click context menu is
-    /// open, so the menu doesn't get cut off (see `CONTEXT_MENU_HEADROOM`'s comment).
-    /// Because `ViewportCommand::InnerSize` doesn't apply until the next frame, the
-    /// window can lag one frame behind right after the menu opens — judged low-impact.
-    fn sync_window_height(&mut self, ctx: &egui::Context) {
-        // While the history panel is open, size to the history row count instead of
-        // the search results (`show_history_panel`). Even with zero history entries,
-        // one row ("no history yet") is still drawn, hence `max(1)`.
-        let rows = if self.history_panel_open {
+    fn visible_rows_cap(&self) -> usize {
+        (self.config.max_results as usize).min(MAX_VISIBLE_ROWS)
+    }
+
+    /// How tall the result/history list should be *drawn*, in rows — the
+    /// window itself only ever grows to fit this many (`sync_window_height`);
+    /// anything beyond it is still rendered, just reachable only by
+    /// scrolling the fixed-height list container (`render`'s
+    /// `visible_row_count`-sized scroll wrapper), not by growing the
+    /// window further. Even with zero history entries, one row ("no
+    /// history yet") is still drawn, hence `max(1)` in that branch.
+    fn visible_row_count(&self) -> usize {
+        if self.history_panel_open {
             self.history
                 .queries
                 .len()
@@ -743,1008 +681,1600 @@ impl IssenApp {
                 .min(self.visible_rows_cap())
         } else {
             self.results.len().min(self.visible_rows_cap())
-        } as f32;
-        let mut height = MAIN_WINDOW_SIZE.1 + rows * RESULT_ROW_HEIGHT;
-        if ctx.any_popup_open() {
-            height += CONTEXT_MENU_HEADROOM;
         }
-        self.set_window_height(ctx, height);
     }
 
-    /// Number of result rows shown without scrolling. The settings window's
-    /// `DragValue` can't set `config.max_results` above `MAX_VISIBLE_ROWS`, but this
-    /// still clamps defensively in case an older `config.toml` on disk has a larger
-    /// value from before that cap existed.
-    fn visible_rows_cap(&self) -> usize {
-        (self.config.max_results as usize).min(MAX_VISIBLE_ROWS)
+    /// One of the search box's toolbar icon buttons (color picker, unit
+    /// converter — see `crate::tools`).
+    fn toolbar_icon_button(
+        key: &'static str,
+        glyph: &'static str,
+        on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(key)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(28.))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .text_size(rems(14. / 16.))
+            .hover(|d| d.bg(hsla(0., 0., 1., 0.08)))
+            // See the text field's own `.occlude()` comment in `render` —
+            // without this, a click here would also count as landing on the
+            // search box's background drag region behind it.
+            .occlude()
+            .on_mouse_down(MouseButton::Left, on_click)
+            .child(glyph)
     }
 
-    fn register_selected_as_alias(&mut self) {
+    fn handle_tray_action(
+        &mut self,
+        action: TrayAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            TrayAction::Open => self.show(window, cx),
+            TrayAction::Settings => {
+                // Matches the egui/eframe version: the tray's Settings
+                // action also brings the main search window up (it's the
+                // only route to Settings that can fire while the main
+                // window is still hidden).
+                self.show(window, cx);
+                self.open_settings_window(cx);
+            }
+            TrayAction::Reindex => self.start_scan(cx),
+            TrayAction::About => {
+                // Matches the egui/eframe version: the tray's About action also
+                // brings the main search window up (it's the only route to
+                // About that can fire while the main window is still hidden).
+                self.show(window, cx);
+                self.opening_secondary_window = true;
+                about_window::open(
+                    &mut self.about_window,
+                    self.strings,
+                    self.config.theme,
+                    self.config.ui_font,
+                    self.config.font_scale,
+                    cx,
+                );
+                self.opening_secondary_window = false;
+            }
+        }
+    }
+
+    /// Toggles a toolbar tool open/closed: a repeat click on the button for
+    /// the tool that's currently showing closes the window (matches the
+    /// egui/eframe version, where both tools shared one viewport); clicking
+    /// while the *other* tool is open switches its content in place instead
+    /// of opening a second window.
+    fn toggle_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
+        if let Some(handle) = &self.tools_window {
+            let current_kind = handle.update(cx, |view, _, _| view.kind()).ok();
+            if current_kind == Some(kind) {
+                let _ = handle.update(cx, |_, window, _| window.remove_window());
+                self.tools_window = None;
+                return;
+            }
+        }
+        self.opening_secondary_window = true;
+        tools::open(
+            &mut self.tools_window,
+            kind,
+            self.strings,
+            self.config.theme,
+            self.config.ui_font,
+            self.config.font_scale,
+            self.config.accent_color,
+            cx,
+        );
+        self.opening_secondary_window = false;
+    }
+
+    /// Opens the settings window (or brings an already-open one to front),
+    /// building the `AppSnapshot` it needs from directly-accessible fields.
+    /// Shared by the tray's Settings action, the main context menu's
+    /// Settings item, and `register_selected_as_alias`.
+    fn open_settings_window(&mut self, cx: &mut Context<Self>) {
+        let weak = cx.weak_entity();
+        let snapshot = crate::settings_window::AppSnapshot {
+            config: self.config.clone(),
+            strings: self.strings,
+            scanning: self.scanning,
+            last_scan_finished: self.last_scan_finished,
+            last_scan_count: self.last_scan_count,
+        };
+        self.opening_secondary_window = true;
+        crate::settings_window::open(&mut self.settings_window, weak, snapshot, cx);
+        self.opening_secondary_window = false;
+    }
+
+    /// "Register as alias" from a result row's context menu: opens the
+    /// settings window and prefills its "add alias" fields with the
+    /// selected result's title/target. Matches the egui/eframe version's
+    /// `SettingsWindow::prefill_alias`.
+    fn register_selected_as_alias(&mut self, cx: &mut Context<Self>) {
         let Some(result) = self.results.get(self.selected) else {
             return;
         };
+        let title = result.title.clone();
         let target = crate::search::target_key(&result.action);
-        self.settings.prefill_alias(result.title.clone(), target);
+        self.open_settings_window(cx);
+        if let Some(handle) = &self.settings_window {
+            let _ = handle.update(cx, |view, window, cx| {
+                view.prefill_alias(title, target, window, cx);
+            });
+        }
     }
 
-    /// Rebuilds runtime state that depends on `language` (display strings, tray
-    /// icon) when it changes. A cheap no-op when nothing changed, so it's fine to
-    /// call from `logic()` every frame (needed to reflect a settings-window change
-    /// immediately).
-    fn apply_language(&mut self, ctx: &egui::Context) {
-        let lang = i18n::resolve(self.config.language);
-        if lang == self.lang {
+    /// "Pin"/"Unpin" from a result row's context menu. Both rebuild via
+    /// `run_search` rather than patching the score in place, so the ranking
+    /// reflects the change immediately — matches the egui/eframe version's
+    /// `RowMenuAction::Pin`/`Unpin`.
+    fn pin_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(result) = self.results.get(self.selected) {
+            let key = crate::search::target_key(&result.action);
+            self.history.pin(&key);
+            if let Err(err) = self.history.save(config::APP_NAME) {
+                eprintln!("issen: failed to save history.toml: {err}");
+            }
+        }
+        self.run_search();
+        cx.notify();
+    }
+
+    fn unpin_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(result) = self.results.get(self.selected) {
+            let key = crate::search::target_key(&result.action);
+            self.history.remove(&key);
+            if let Err(err) = self.history.save(config::APP_NAME) {
+                eprintln!("issen: failed to save history.toml: {err}");
+            }
+        }
+        self.run_search();
+        cx.notify();
+    }
+
+    /// Toggles the query-history panel (🕘 icon).
+    fn toggle_history_panel(&mut self, cx: &mut Context<Self>) {
+        self.history_panel_open = !self.history_panel_open;
+        self.scroll_handle.set_offset(Point::default());
+        cx.notify();
+    }
+
+    /// Re-runs a past query picked from the history panel. Doesn't execute
+    /// anything directly — it's a "re-search," not a "re-run" (matches the
+    /// egui/eframe version's `show_history_panel`).
+    fn use_history_query(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(query) = self.history.queries.get(index).cloned() else {
+            return;
+        };
+        self.query = query.into();
+        let len = self.query.len();
+        self.selected_range = len..len;
+        self.marked_range = None;
+        self.history_panel_open = false;
+        self.run_search();
+        cx.notify();
+    }
+
+    // --- Result-list keyboard actions ---
+    //
+    // While the query-history panel is open, `self.results` is stale (from
+    // the last real search), so every one of these guards on
+    // `history_panel_open` and no-ops instead of acting on it — matches the
+    // egui/eframe version's single early-return in `logic()`.
+
+    fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_panel_open {
             return;
         }
-        self.lang = lang;
-        self.strings = Strings::for_lang(lang);
-        // Keep the existing tray icon if rebuilding fails (its labels stay in the
-        // old language, but that's better than crashing the whole app).
-        if let Some(tray) = TrayHandle::new(ctx, self.strings) {
-            self.tray = tray;
-            // A freshly rebuilt tray always starts with idle labels/tooltip; if a
-            // scan is in progress when the language switch happens, reapply that state.
-            if self.pending_scan.is_some() {
-                self.tray.set_scanning(self.strings, true);
-            }
+        self.selected = self.selected.saturating_sub(1);
+        self.scroll_handle.scroll_to_item(self.selected);
+        cx.notify();
+    }
+
+    fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.history_panel_open {
+            return;
+        }
+        if !self.results.is_empty() {
+            self.selected = (self.selected + 1).min(self.results.len() - 1);
+        }
+        self.scroll_handle.scroll_to_item(self.selected);
+        cx.notify();
+    }
+
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_panel_open {
+            return;
+        }
+        self.run_result_action(ResultActionKind::Default, window, cx);
+    }
+
+    fn run_as_admin_action(
+        &mut self,
+        _: &RunAsAdminAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.history_panel_open {
+            return;
+        }
+        self.run_result_action(ResultActionKind::RunAsAdmin, window, cx);
+    }
+
+    fn open_location_action(
+        &mut self,
+        _: &OpenLocationAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.history_panel_open {
+            return;
+        }
+        self.run_result_action(ResultActionKind::OpenLocation, window, cx);
+    }
+
+    /// Closes an open context menu first, if any (GPUI has no built-in
+    /// popup that would otherwise swallow this itself); only hides the
+    /// whole window on a second Escape.
+    fn escape_action(&mut self, _: &EscapeAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+            return;
+        }
+        self.hide(window, cx);
+    }
+
+    fn alt_digit(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.history_panel_open {
+            return;
+        }
+        let visible_rows = self.results.len().min(self.visible_rows_cap());
+        if idx < visible_rows {
+            self.selected = idx;
+            self.run_result_action(ResultActionKind::Default, window, cx);
+        }
+    }
+
+    fn alt_num_1(&mut self, _: &AltNum1, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(0, w, cx);
+    }
+    fn alt_num_2(&mut self, _: &AltNum2, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(1, w, cx);
+    }
+    fn alt_num_3(&mut self, _: &AltNum3, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(2, w, cx);
+    }
+    fn alt_num_4(&mut self, _: &AltNum4, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(3, w, cx);
+    }
+    fn alt_num_5(&mut self, _: &AltNum5, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(4, w, cx);
+    }
+    fn alt_num_6(&mut self, _: &AltNum6, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(5, w, cx);
+    }
+    fn alt_num_7(&mut self, _: &AltNum7, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(6, w, cx);
+    }
+    fn alt_num_8(&mut self, _: &AltNum8, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(7, w, cx);
+    }
+    fn alt_num_9(&mut self, _: &AltNum9, w: &mut Window, cx: &mut Context<Self>) {
+        self.alt_digit(8, w, cx);
+    }
+
+    // --- Text-input editing (ported from examples/gpui_spike_input.rs) ---
+
+    fn text_left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
         } else {
-            eprintln!("issen: failed to rebuild tray icon after language change; keeping old one");
+            self.move_to(self.selected_range.start, cx)
         }
     }
 
-    /// The input box's right-click menu. Shared by both the text area itself and the
-    /// blank space above/below it (the drag region, `drag-bg`) so either can open
-    /// the same menu.
-    fn show_main_context_menu(&mut self, ui: &mut egui::Ui) {
-        if ui.button(self.strings.tray_settings).clicked() {
-            self.settings.open();
-            ui.close();
-        }
-        if ui.button(self.strings.tray_reindex).clicked() {
-            self.start_scan();
-            ui.close();
-        }
-        ui.separator();
-        if ui.button(self.strings.tray_quit).clicked() {
-            // See `handle_tray_action`'s `TrayAction::Quit` doc comment: `ViewportCommand::Close`
-            // is unreliable while the main window is hidden, so this exits directly instead.
-            std::process::exit(0);
+    fn text_right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.move_to(self.next_boundary(self.selected_range.end), cx);
+        } else {
+            self.move_to(self.selected_range.end, cx)
         }
     }
 
-    /// The list of past search queries opened via the history icon (🕘) next to the
-    /// input box. Visually and structurally close to the normal result list
-    /// (`ui()`), but simplified — no Alt+N hint chips or action menu, and no
-    /// keyboard selection yet (mouse-click re-search is enough for now; YAGNI).
-    /// Clicking a row replaces `self.query` with that query and re-runs search
-    /// (doesn't execute anything directly — it's a "re-search," not a "re-run").
-    fn show_history_panel(&mut self, ui: &mut egui::Ui) {
-        if self.history.queries.is_empty() {
-            ui.horizontal(|ui| {
-                ui.set_min_height(RESULT_ROW_HEIGHT);
-                ui.add_space(CONTENT_PADDING + 10.0);
-                ui.weak(self.strings.history_empty);
-            });
-            return;
-        }
-
-        let visible_rows_cap = self.visible_rows_cap();
-        let scroll_height =
-            self.history.queries.len().min(visible_rows_cap) as f32 * RESULT_ROW_HEIGHT;
-        let mut chosen: Option<usize> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("history-scroll")
-            .max_height(scroll_height)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for (i, query) in self.history.queries.iter().enumerate() {
-                    let row_id = ui.id().with(("history_row", i));
-                    let row = egui::Frame::default()
-                        .corner_radius(10.0)
-                        .inner_margin(egui::Margin::symmetric(CONTENT_PADDING as i8 + 10, 0))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.set_min_height(RESULT_ROW_HEIGHT);
-                                ui.label(query);
-                            });
-                        })
-                        .response;
-                    let row = ui
-                        .interact(row.rect, row_id, egui::Sense::click())
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if row.clicked() {
-                        chosen = Some(i);
-                    }
-                }
-            });
-
-        // Click detection happens outside the scroll area's closure, then
-        // `self.history` is read afterward — same reason as `pending_row_action` in
-        // the results list (don't mutate data still borrowed by an in-progress loop).
-        if let Some(i) = chosen {
-            self.query = self.history.queries[i].clone();
-            self.history_panel_open = false;
-            self.run_search();
-        }
+    fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
     }
 
-    /// Tells `HotkeyListener` to live-reregister when `config.hotkey` changes. A
-    /// cheap no-op when nothing changed, so safe to call every frame from `logic()`
-    /// (same pattern as `apply_language`). Handling of invalid strings (including
-    /// partial input while typing in the settings window) is left to
-    /// `HotkeyListener` (see `hotkey.rs::spawn`'s doc comment).
-    fn apply_hotkey_change(&mut self) {
-        if self.config.hotkey == self.last_hotkey_spec {
-            return;
-        }
-        self.last_hotkey_spec = self.config.hotkey.clone();
-        self.hotkey.update_hotkey(self.last_hotkey_spec.clone());
+    fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.next_boundary(self.cursor_offset()), cx);
     }
 
-    /// Rescales `egui::Style::text_styles`'s font sizes when `config.font_scale`
-    /// changes. A no-op when nothing changed (same guard pattern as
-    /// `apply_language`; unlike `apply_theme`, this isn't called unconditionally
-    /// every frame, since it triggers font-atlas relayout). Always scales from
-    /// `egui::Style::default()`'s base sizes rather than the current style, so
-    /// repeated changes don't compound the scale factor.
-    fn apply_font_scale(&mut self, ctx: &egui::Context) {
-        if (self.config.font_scale - self.applied_font_scale).abs() < f32::EPSILON {
-            return;
-        }
-        self.applied_font_scale = self.config.font_scale;
-        let scale = self.applied_font_scale;
-        let base = egui::Style::default();
-        // Apply the same scale to both the light and dark `Style` (`egui::Context`
-        // keeps a separate `Style` per theme).
-        ctx.all_styles_mut(|style| {
-            for (text_style, base_font_id) in &base.text_styles {
-                if let Some(font_id) = style.text_styles.get_mut(text_style) {
-                    font_id.size = base_font_id.size * scale;
-                }
+    fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+        self.select_to(self.query.len(), cx)
+    }
+
+    fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(self.query.len(), cx);
+    }
+
+    fn text_backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let prev = self.previous_boundary(self.cursor_offset());
+            if self.cursor_offset() == prev {
+                window.play_system_bell();
+                return;
             }
+            self.select_to(prev, cx)
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn text_delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            let next = self.next_boundary(self.cursor_offset());
+            if self.cursor_offset() == next {
+                window.play_system_bell();
+                return;
+            }
+            self.select_to(next, cx)
+        }
+        self.replace_text_in_range(None, "", window, cx);
+    }
+
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.is_selecting = true;
+        if event.modifiers.shift {
+            self.select_to(self.index_for_mouse_position(event.position), cx);
+        } else {
+            self.move_to(self.index_for_mouse_position(event.position), cx)
+        }
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
+        self.is_selecting = false;
+    }
+
+    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.is_selecting {
+            self.select_to(self.index_for_mouse_position(event.position), cx);
+        }
+    }
+
+    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+            self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+        }
+    }
+
+    /// Ctrl+C: copies the selected text if any, otherwise falls back to
+    /// copying the selected result's path (same dual meaning as the
+    /// egui/eframe version's `ResultActionKind::CopyPath`).
+    fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.query[self.selected_range.clone()].to_string(),
+            ));
+            return;
+        }
+        if let Some(SearchResult {
+            action: Action::Launch { path, .. },
+            ..
+        }) = self.results.get(self.selected)
+        {
+            crate::launch::copy_to_clipboard(&path.display().to_string());
+        }
+    }
+
+    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.selected_range.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(
+                self.query[self.selected_range.clone()].to_string(),
+            ));
+            self.replace_text_in_range(None, "", window, cx);
+        }
+    }
+
+    fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.selected_range = offset..offset;
+        cx.notify()
+    }
+
+    fn cursor_offset(&self) -> usize {
+        if self.selection_reversed {
+            self.selected_range.start
+        } else {
+            self.selected_range.end
+        }
+    }
+
+    fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
+        if self.query.is_empty() {
+            return 0;
+        }
+        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
+        else {
+            return 0;
+        };
+        if position.y < bounds.top() {
+            return 0;
+        }
+        if position.y > bounds.bottom() {
+            return self.query.len();
+        }
+        line.closest_index_for_x(position.x - bounds.left())
+    }
+
+    fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        if self.selection_reversed {
+            self.selected_range.start = offset
+        } else {
+            self.selected_range.end = offset
+        };
+        if self.selected_range.end < self.selected_range.start {
+            self.selection_reversed = !self.selection_reversed;
+            self.selected_range = self.selected_range.end..self.selected_range.start;
+        }
+        cx.notify()
+    }
+
+    fn offset_from_utf16(&self, offset: usize) -> usize {
+        let mut utf8_offset = 0;
+        let mut utf16_count = 0;
+        for ch in self.query.chars() {
+            if utf16_count >= offset {
+                break;
+            }
+            utf16_count += ch.len_utf16();
+            utf8_offset += ch.len_utf8();
+        }
+        utf8_offset
+    }
+
+    fn offset_to_utf16(&self, offset: usize) -> usize {
+        let mut utf16_offset = 0;
+        let mut utf8_count = 0;
+        for ch in self.query.chars() {
+            if utf8_count >= offset {
+                break;
+            }
+            utf8_count += ch.len_utf8();
+            utf16_offset += ch.len_utf16();
+        }
+        utf16_offset
+    }
+
+    fn range_to_utf16(&self, range: &Range<usize>) -> Range<usize> {
+        self.offset_to_utf16(range.start)..self.offset_to_utf16(range.end)
+    }
+
+    fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
+        self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
+    }
+
+    fn previous_boundary(&self, offset: usize) -> usize {
+        self.query
+            .grapheme_indices(true)
+            .rev()
+            .find_map(|(idx, _)| (idx < offset).then_some(idx))
+            .unwrap_or(0)
+    }
+
+    fn next_boundary(&self, offset: usize) -> usize {
+        self.query
+            .grapheme_indices(true)
+            .find_map(|(idx, _)| (idx > offset).then_some(idx))
+            .unwrap_or(self.query.len())
+    }
+
+    // --- Right-click context menu ---
+    //
+    // GPUI core has no `context_menu`-style widget, unlike egui — this is a
+    // custom overlay built from `anchored()` (keeps it inside the window
+    // bounds) wrapped in `deferred()` (paints after every sibling, i.e. on
+    // top). See `render_context_menu` for how it's actually drawn.
+
+    fn open_main_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = Some(OpenContextMenu {
+            target: ContextMenuTarget::Main,
+            position: event.position,
         });
+        // A right-click landing on the search box's drag region (see
+        // `render`'s `search_box`) reaches this handler via Windows'
+        // `WM_NCRBUTTONDOWN` path (`window_control_area`'s hit-test), not
+        // the normal client-area `WM_RBUTTONDOWN`. Without stopping
+        // propagation here, that NC message is left unhandled and falls
+        // through to `DefWindowProc`, which pops the native OS system menu
+        // on top of this custom one.
+        cx.stop_propagation();
+        cx.notify();
     }
 
-    /// Re-invokes `crate::fonts::apply_fonts` only when `config.ui_font` actually
-    /// changes (same guard pattern as `apply_font_scale`, since it also rebuilds the
-    /// font atlas and shouldn't run every frame).
-    fn apply_ui_font(&mut self, ctx: &egui::Context) {
-        if self.config.ui_font == self.applied_ui_font {
-            return;
-        }
-        self.applied_ui_font = self.config.ui_font;
-        crate::fonts::apply_fonts(ctx, self.applied_ui_font);
+    /// One row of a context menu (label + click handler). Visually distinct
+    /// from `toolbar_icon_button` (full-width row vs. a square icon) but the
+    /// same hover/cursor treatment.
+    fn context_menu_item(
+        key: &'static str,
+        label: &'static str,
+        on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(key)
+            .h(px(32.))
+            .px(px(12.))
+            .flex()
+            .items_center()
+            .text_size(rems(13. / 16.))
+            .text_color(white())
+            .cursor_pointer()
+            .hover(|d| d.bg(hsla(0., 0., 1., 0.08)))
+            .on_mouse_down(MouseButton::Left, on_click)
+            .child(label)
     }
 
-    /// The tray's "Settings"/"About" actions are the only path that can be triggered
-    /// while the main window is still hidden (every other route to settings/about —
-    /// the right-click menu, registering an alias — only works while the main window
-    /// is already visible). This doesn't call `self.settings.open()`/
-    /// `self.about_open = true` immediately because, while the main window is
-    /// hidden, `eframe` takes a special path for it (`check_redraw_requests` calls
-    /// `ui()` directly for windows that never get a `RedrawRequested` event while
-    /// hidden — a workaround for emilk/egui#5229) that lacks the "current event
-    /// loop" context a viewport needs to be created. Constructing the settings/about
-    /// viewport for the first time via `show_viewport_immediate` from inside that
-    /// path crashes with "egui backend is implemented incorrectly - the user
-    /// callback was never called" (reproduced on real hardware). Instead,
-    /// `set_visible(true)` schedules the main window to become visible, and actually
-    /// opening the settings/about window is deferred via `pending_open` to the start
-    /// of the *next* frame's `logic()`. By then `Visible(true)` — well, the position
-    /// move that makes it visible — has already been applied on the OS side, so
-    /// `ui()` runs through its normal path (with a proper event-loop context) and
-    /// can safely construct the new viewport.
-    fn handle_tray_action(&mut self, ctx: &egui::Context, action: TrayAction) {
-        match action {
-            TrayAction::Open => {
-                self.set_visible(ctx, true);
+    fn context_menu_separator() -> impl IntoElement {
+        div()
+            .h(px(1.))
+            .mx(px(6.))
+            .my(px(4.))
+            .bg(hsla(0., 0., 1., 0.12))
+    }
+
+    /// Builds the open context menu's overlay element, if any. Reads
+    /// `self.context_menu` (target + position) fresh each render, so a
+    /// `Row(i)` menu whose row disappeared (results changed while it was
+    /// open) is closed rather than shown against a stale index.
+    fn render_context_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.context_menu?;
+        let items: Vec<AnyElement> = match menu.target {
+            ContextMenuTarget::Main => vec![
+                Self::context_menu_item(
+                    "ctx-settings",
+                    self.strings.tray_settings,
+                    cx.listener(|this, _, _, cx| {
+                        this.context_menu = None;
+                        this.open_settings_window(cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+                Self::context_menu_item(
+                    "ctx-reindex",
+                    self.strings.tray_reindex,
+                    cx.listener(|this, _, _, cx| {
+                        this.context_menu = None;
+                        this.start_scan(cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+                Self::context_menu_separator().into_any_element(),
+                Self::context_menu_item("ctx-quit", self.strings.tray_quit, |_, _, _| {
+                    // See `tray.rs`'s `ensure_event_forwarding` doc comment
+                    // for why Quit exits directly rather than going through
+                    // any window-close path.
+                    std::process::exit(0);
+                })
+                .into_any_element(),
+            ],
+            ContextMenuTarget::Row(i) => {
+                let Some(result) = self.results.get(i) else {
+                    self.context_menu = None;
+                    return None;
+                };
+                let is_file_action = matches!(result.action, Action::Launch { .. });
+                let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
+
+                let mut items = vec![Self::context_menu_item(
+                    "ctx-run",
+                    self.strings.action_run,
+                    cx.listener(move |this, _, window, cx| {
+                        this.context_menu = None;
+                        this.selected = i;
+                        this.run_result_action(ResultActionKind::Default, window, cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()];
+                if is_file_action {
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-run-as-admin",
+                            self.strings.action_run_as_admin,
+                            cx.listener(move |this, _, window, cx| {
+                                this.context_menu = None;
+                                this.selected = i;
+                                this.run_result_action(ResultActionKind::RunAsAdmin, window, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-open-location",
+                            self.strings.action_open_location,
+                            cx.listener(move |this, _, window, cx| {
+                                this.context_menu = None;
+                                this.selected = i;
+                                this.run_result_action(ResultActionKind::OpenLocation, window, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-copy-path",
+                            self.strings.action_copy_path,
+                            cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                if let Some(SearchResult {
+                                    action: Action::Launch { path, .. },
+                                    ..
+                                }) = this.results.get(i)
+                                {
+                                    crate::launch::copy_to_clipboard(&path.display().to_string());
+                                }
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                items.push(
+                    Self::context_menu_item(
+                        "ctx-register-alias",
+                        self.strings.action_register_alias,
+                        cx.listener(move |this, _, _, cx| {
+                            this.context_menu = None;
+                            this.selected = i;
+                            this.register_selected_as_alias(cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                );
+                if is_pinned {
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-unpin",
+                            self.strings.action_unpin,
+                            cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.selected = i;
+                                this.unpin_selected(cx);
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                } else {
+                    items.push(
+                        Self::context_menu_item(
+                            "ctx-pin",
+                            self.strings.action_pin,
+                            cx.listener(move |this, _, _, cx| {
+                                this.context_menu = None;
+                                this.selected = i;
+                                this.pin_selected(cx);
+                            }),
+                        )
+                        .into_any_element(),
+                    );
+                }
+                items
             }
-            TrayAction::Settings => {
-                self.set_visible(ctx, true);
-                self.pending_open = Some(PendingOpen::Settings);
-            }
-            TrayAction::Reindex => {
-                self.start_scan();
-            }
-            TrayAction::About => {
-                self.set_visible(ctx, true);
-                self.pending_open = Some(PendingOpen::About);
-            } // Quit has no variant here — see `tray.rs`'s `ensure_event_forwarding` doc
-              // comment for why it's handled directly in the `MenuEvent` callback instead.
-        }
+        };
+
+        Some(
+            deferred(
+                anchored().position(menu.position).snap_to_window().child(
+                    div()
+                        .id("context-menu")
+                        .occlude()
+                        .flex()
+                        .flex_col()
+                        .py(px(4.))
+                        .min_w(px(190.))
+                        .rounded(px(8.))
+                        .bg(hsla(220. / 360., 0.12, 0.13, 0.98))
+                        .border_1()
+                        .border_color(hsla(0., 0., 1., 0.14))
+                        .shadow_lg()
+                        // Capture-phase + `stop_propagation()` so an
+                        // outside click both closes the menu and doesn't
+                        // also fall through to whatever's underneath it
+                        // (e.g. launching a result row the click landed
+                        // on) — see `dispatch_mouse_event`'s capture/
+                        // bubble split in gpui's `window.rs`.
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.context_menu = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .children(items),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 }
 
-/// Gets the main window's HWND from `CreationContext`. `eframe::CreationContext`
-/// implements `raw_window_handle::HasWindowHandle`, and by this point the OS window
-/// has already been created (this runs inside `main.rs::run_native`'s callback).
-fn window_hwnd(cc: &eframe::CreationContext<'_>) -> Option<HWND> {
-    let handle = cc.window_handle().ok()?;
+impl EntityInputHandler for IssenApp {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let range = self.range_from_utf16(&range_utf16);
+        actual_range.replace(self.range_to_utf16(&range));
+        Some(self.query[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: self.range_to_utf16(&self.selected_range),
+            reversed: self.selection_reversed,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_range
+            .as_ref()
+            .map(|range| self.range_to_utf16(range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.range_from_utf16(range_utf16))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+
+        self.query =
+            (self.query[0..range.start].to_owned() + new_text + &self.query[range.end..]).into();
+        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.marked_range.take();
+        // Switch back to the normal search results, not the history panel,
+        // as soon as the query is edited (showing both at once would be
+        // confusing) — matches the egui/eframe version's `response.changed()`
+        // handling.
+        self.history_panel_open = false;
+        // Every plain (non-IME) keystroke and every IME composition's final
+        // commit go through this method (see `replace_and_mark_text_in_range`
+        // for the in-progress-composition case), so this is the single place
+        // that needs to re-run search after a query edit.
+        self.run_search();
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let range = range_utf16
+            .as_ref()
+            .map(|range_utf16| self.range_from_utf16(range_utf16))
+            .or(self.marked_range.clone())
+            .unwrap_or(self.selected_range.clone());
+
+        self.query =
+            (self.query[0..range.start].to_owned() + new_text + &self.query[range.end..]).into();
+        if !new_text.is_empty() {
+            self.marked_range = Some(range.start..range.start + new_text.len());
+        } else {
+            self.marked_range = None;
+        }
+        self.selected_range = new_selected_range_utf16
+            .as_ref()
+            .map(|range_utf16| self.range_from_utf16(range_utf16))
+            .map(|new_range| new_range.start + range.start..new_range.end + range.end)
+            .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
+
+        self.history_panel_open = false;
+        // Re-searching while composition is still in progress (not yet
+        // committed) gives more responsive incremental results — the same
+        // reasoning as searching on every keystroke of plain input.
+        self.run_search();
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let last_layout = self.last_layout.as_ref()?;
+        let range = self.range_from_utf16(&range_utf16);
+        Some(Bounds::from_corners(
+            point(
+                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.top(),
+            ),
+            point(
+                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.bottom(),
+            ),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let line_point = self.last_bounds?.localize(&point)?;
+        let last_layout = self.last_layout.as_ref()?;
+        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        Some(self.offset_to_utf16(utf8_index))
+    }
+}
+
+impl Focusable for IssenApp {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+/// Renders the search box's text (or placeholder) with IME marked-range
+/// underlining, plus the cursor/selection quads. Ported from
+/// `examples/gpui_spike_input.rs`'s `TextElement`.
+struct TextElement {
+    input: Entity<IssenApp>,
+}
+
+struct PrepaintState {
+    line: Option<ShapedLine>,
+    cursor: Option<PaintQuad>,
+    selection: Option<PaintQuad>,
+}
+
+impl IntoElement for TextElement {
+    type Element = Self;
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for TextElement {
+    type RequestLayoutState = ();
+    type PrepaintState = PrepaintState;
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut style = Style::default();
+        style.size.width = gpui::relative(1.).into();
+        style.size.height = window.line_height().into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let input = self.input.read(cx);
+        let content = input.query.clone();
+        let selected_range = input.selected_range.clone();
+        let cursor = input.cursor_offset();
+        let style = window.text_style();
+
+        let (display_text, text_color) = if content.is_empty() {
+            (
+                SharedString::from(input.strings.search_hint),
+                hsla(0., 0., 1., 0.4),
+            )
+        } else {
+            (content, style.color)
+        };
+
+        let run = TextRun {
+            len: display_text.len(),
+            font: style.font(),
+            color: text_color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+            vec![
+                TextRun {
+                    len: marked_range.start,
+                    ..run.clone()
+                },
+                TextRun {
+                    len: marked_range.end - marked_range.start,
+                    underline: Some(UnderlineStyle {
+                        color: Some(run.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..run.clone()
+                },
+                TextRun {
+                    len: display_text.len() - marked_range.end,
+                    ..run
+                },
+            ]
+            .into_iter()
+            .filter(|run| run.len > 0)
+            .collect()
+        } else {
+            vec![run]
+        };
+
+        let font_size = style.font_size.to_pixels(window.rem_size());
+        let line = window
+            .text_system()
+            .shape_line(display_text, font_size, &runs, None);
+
+        let cursor_pos = line.x_for_index(cursor);
+        let (selection, cursor) = if selected_range.is_empty() {
+            (
+                None,
+                Some(fill(
+                    Bounds::new(
+                        point(bounds.left() + cursor_pos, bounds.top()),
+                        size(px(2.), bounds.bottom() - bounds.top()),
+                    ),
+                    ui_chrome::accent_color(self.input.read(cx).config.accent_color),
+                )),
+            )
+        } else {
+            (
+                Some(fill(
+                    Bounds::from_corners(
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.start),
+                            bounds.top(),
+                        ),
+                        point(
+                            bounds.left() + line.x_for_index(selected_range.end),
+                            bounds.bottom(),
+                        ),
+                    ),
+                    hsla(0.6, 0.9, 0.6, 0.25),
+                )),
+                None,
+            )
+        };
+        PrepaintState {
+            line: Some(line),
+            cursor,
+            selection,
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let focus_handle = self.input.read(cx).focus_handle.clone();
+        window.handle_input(
+            &focus_handle,
+            ElementInputHandler::new(bounds, self.input.clone()),
+            cx,
+        );
+        if let Some(selection) = prepaint.selection.take() {
+            window.paint_quad(selection)
+        }
+        let line = prepaint.line.take().unwrap();
+        line.paint(
+            bounds.origin,
+            window.line_height(),
+            gpui::TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .unwrap();
+
+        if focus_handle.is_focused(window) {
+            if let Some(cursor) = prepaint.cursor.take() {
+                window.paint_quad(cursor);
+            }
+        }
+
+        self.input.update(cx, |input, _cx| {
+            input.last_layout = Some(line);
+            input.last_bounds = Some(bounds);
+        });
+    }
+}
+
+impl Render for IssenApp {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        ui_chrome::apply_font_scale(window, self.config.font_scale);
+        self.sync_window_height(window);
+
+        let accent = ui_chrome::accent_color(self.config.accent_color);
+        // 実機確認の結果、0.80が好みの透け具合として指定された。
+        let glass_bg = hsla(220. / 360., 0.12, 0.09, 0.80);
+        let visible_rows_cap = self.visible_rows_cap();
+
+        let search_box = div()
+            .flex_none()
+            .w_full()
+            .h(px(MAIN_WINDOW_SIZE.1))
+            // Right-clicking anywhere in the input row (background, text
+            // field, or toolbar buttons — a button's own `Left`-only
+            // listener doesn't intercept `Right`) opens the Settings/
+            // Reindex/Quit menu, matching the egui/eframe version's shared
+            // `show_main_context_menu` (attached to both its drag
+            // background and the `TextEdit` response).
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::open_main_context_menu),
+            )
+            .child(
+                // With `with_decorations(false)` there's no OS title bar to
+                // drag, so the input row doubles as one — an
+                // absolutely-positioned, full-row background marked as a
+                // `WindowControlArea::Drag` hit-test region. A sibling of the
+                // padded content row below (not its parent, and not padded
+                // itself), so `inset_0` spans the row's true full width
+                // rather than just its content box; painted first so the
+                // accent bar/text field/toolbar buttons (painted after, thus
+                // on top) still claim their own clicks — this only ends up
+                // "hit" in the gaps between them. Matches the egui/eframe
+                // version's `drag_rect`/`drag-bg`, sized to just this row so
+                // it can't compete with clicking a result row below.
+                div()
+                    .absolute()
+                    .inset_0()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .size_full()
+                    .px(px(CONTENT_PADDING))
+                    .gap_2()
+                    .child(div().w(px(3.)).h(px(28.)).rounded(px(1.5)).bg(accent))
+                    .child(
+                        div()
+                            .flex_1()
+                            // GPUI's hit-test walks every overlapping hitbox
+                            // front-to-back and only stops at one marked
+                            // `BlockMouse` (`Window::hit_test`) — without
+                            // `.occlude()` here, a click anywhere on this
+                            // div would *also* still count as landing on the
+                            // background drag-bg behind it (same rect,
+                            // unconditionally marked `WindowControlArea::
+                            // Drag`), so typed-text drag-to-select would
+                            // double as a window-drag on every click.
+                            // `.occlude()` stops the hit-test from reaching
+                            // that far, leaving only this div's own
+                            // (conditional) drag registration in play.
+                            .occlude()
+                            .cursor(CursorStyle::IBeam)
+                            .text_color(white())
+                            .text_size(rems(20. / 16.))
+                            .line_height(px(28.))
+                            // `TextEdit`-equivalent drag normally means
+                            // left-drag selects text, so the window can't be
+                            // dragged from on top of it. When the query is
+                            // empty there's no selectable text, so this div
+                            // doubles as a drag region too (matches the
+                            // egui/eframe version's `response.
+                            // drag_started_by` repurposing) — while typed
+                            // text exists, only the background above still
+                            // drags.
+                            .when(self.query.is_empty(), |d| {
+                                d.window_control_area(WindowControlArea::Drag)
+                            })
+                            // Mouse handlers for text selection are scoped to
+                            // just this div (not the top-level container
+                            // below) so clicking a result row doesn't also
+                            // register as a text-selection mouse-down on the
+                            // search box.
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
+                            .on_mouse_move(cx.listener(Self::on_mouse_move))
+                            .child(TextElement { input: cx.entity() }),
+                    )
+                    .child(Self::toolbar_icon_button(
+                        "toolbar-color-picker",
+                        "\u{1F3A8}",
+                        cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::ColorPicker, cx)),
+                    ))
+                    .child(Self::toolbar_icon_button(
+                        "toolbar-unit-converter",
+                        "\u{1F4D0}",
+                        cx.listener(|this, _, _, cx| this.toggle_tool(ToolKind::UnitConverter, cx)),
+                    ))
+                    .child(Self::toolbar_icon_button(
+                        "toolbar-history",
+                        "\u{1F558}",
+                        cx.listener(|this, _, _, cx| this.toggle_history_panel(cx)),
+                    )),
+            );
+
+        let rows: Vec<AnyElement> = if self.history_panel_open {
+            if self.history.queries.is_empty() {
+                vec![div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .h(px(RESULT_ROW_HEIGHT))
+                    .px(px(CONTENT_PADDING + 10.0))
+                    .text_color(hsla(0., 0., 1., 0.5))
+                    .child(self.strings.history_empty)
+                    .into_any_element()]
+            } else {
+                self.history
+                    .queries
+                    .iter()
+                    .enumerate()
+                    // All rows are rendered (not capped to `visible_rows_cap`
+                    // here) — the fixed-height, `overflow_y_scroll` wrapper
+                    // this list is rendered into (below) is what keeps
+                    // `flex_col`'s default flex-shrink from compressing rows
+                    // to fit and makes anything beyond `visible_rows_cap`
+                    // reachable by scrolling instead of just invisible.
+                    .map(|(i, query)| {
+                        div()
+                            .id(("history-row", i))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .h(px(RESULT_ROW_HEIGHT))
+                            .px(px(CONTENT_PADDING + 10.0))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(hsla(0., 0., 1., 0.09)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.use_history_query(i, cx)),
+                            )
+                            .text_color(white())
+                            .child(query.clone())
+                            .into_any_element()
+                    })
+                    .collect()
+            }
+        } else {
+            self.results
+                .iter()
+                .enumerate()
+                // See the history-row comment above — all rows are rendered
+                // into the fixed-height scroll wrapper below, not capped
+                // here.
+                .map(|(i, result)| {
+                    let is_selected = i == self.selected;
+                    let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
+                    let hint = if i == 0 {
+                        "\u{23ce}".to_string()
+                    } else if i < visible_rows_cap {
+                        format!("Alt+{}", i + 1)
+                    } else {
+                        String::new()
+                    };
+                    div()
+                        .id(("result-row", i))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .h(px(RESULT_ROW_HEIGHT))
+                        .px(px(CONTENT_PADDING + 10.0))
+                        .gap_2()
+                        .when(is_selected, |d| d.bg(hsla(0., 0., 1., 0.09)))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.selected = i;
+                                this.run_result_action(ResultActionKind::Default, window, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.selected = i;
+                                this.context_menu = Some(OpenContextMenu {
+                                    target: ContextMenuTarget::Row(i),
+                                    position: event.position,
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child(if is_pinned {
+                            div()
+                                .text_size(rems(11. / 16.))
+                                .text_color(accent)
+                                .child("\u{1F4CC}")
+                        } else {
+                            div()
+                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_color(if is_selected { accent } else { white() })
+                                        .child(result.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(hsla(0., 0., 1., 0.55))
+                                        .text_size(rems(12. / 16.))
+                                        .child(result.subtitle.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(rems(10. / 16.))
+                                .text_color(hsla(0., 0., 1., 0.5))
+                                .child(hint),
+                        )
+                        .into_any_element()
+                })
+                .collect()
+        };
+
+        let context_menu_overlay = self.render_context_menu(cx);
+
+        // Fixed-height wrapper, not just a bare `flex_col` sibling of
+        // `search_box` — matches the height `sync_window_height` already
+        // gives the window (`visible_row_count() * RESULT_ROW_HEIGHT`), so
+        // rows beyond that don't compress everything else to fit (GPUI's
+        // default `flex-shrink: 1`) and are instead reachable by scrolling
+        // this container (mouse wheel, or `move_up`/`move_down`'s
+        // `scroll_to_item`) rather than just invisible.
+        let rows_list = div()
+            .id("results-scroll")
+            .flex_none()
+            .w_full()
+            .h(px(self.visible_row_count() as f32 * RESULT_ROW_HEIGHT))
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
+            .children(rows);
+
+        div()
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::run_as_admin_action))
+            .on_action(cx.listener(Self::open_location_action))
+            .on_action(cx.listener(Self::escape_action))
+            .on_action(cx.listener(Self::alt_num_1))
+            .on_action(cx.listener(Self::alt_num_2))
+            .on_action(cx.listener(Self::alt_num_3))
+            .on_action(cx.listener(Self::alt_num_4))
+            .on_action(cx.listener(Self::alt_num_5))
+            .on_action(cx.listener(Self::alt_num_6))
+            .on_action(cx.listener(Self::alt_num_7))
+            .on_action(cx.listener(Self::alt_num_8))
+            .on_action(cx.listener(Self::alt_num_9))
+            .on_action(cx.listener(Self::text_backspace))
+            .on_action(cx.listener(Self::text_delete))
+            .on_action(cx.listener(Self::text_left))
+            .on_action(cx.listener(Self::text_right))
+            .on_action(cx.listener(Self::select_left))
+            .on_action(cx.listener(Self::select_right))
+            .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::home))
+            .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::paste))
+            .on_action(cx.listener(Self::cut))
+            .on_action(cx.listener(Self::copy))
+            .size_full()
+            .flex()
+            .flex_col()
+            .font_family(crate::fonts::ui_font_family(self.config.ui_font))
+            .bg(glass_bg)
+            .rounded(px(0.))
+            .border_1()
+            .border_color(hsla(0., 0., 1., 0.14))
+            .child(search_box)
+            .child(rows_list)
+            .children(context_menu_overlay)
+    }
+}
+
+// --- Win32 helpers ---
+
+/// `Window` has an inherent `window_handle()` method (returns GPUI's own
+/// `AnyWindowHandle`, not an HWND) with the same name as the
+/// `HasWindowHandle` trait method, so the trait method must be called
+/// fully-qualified to get the actual HWND.
+fn window_hwnd(window: &Window) -> Option<HWND> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
     match handle.as_raw() {
         RawWindowHandle::Win32(handle) => Some(HWND(handle.hwnd.get() as *mut core::ffi::c_void)),
         _ => None,
     }
 }
 
-/// Because the main window stays permanently OS-visible under the resident/display
-/// model (see `set_visible`'s doc comment), it would otherwise keep showing up as an
-/// Alt+Tab candidate (`main.rs`'s `with_taskbar(false)` only removes the taskbar
-/// entry, not the Alt+Tab one). Setting the `WS_EX_TOOLWINDOW` extended window style
-/// excludes it from Alt+Tab regardless of visibility or on-screen/off-screen
-/// position. This bit only needs to be set once after window creation, so it's
-/// called once from `new()`.
+/// Excludes the window from Alt+Tab and the taskbar (needed since the
+/// window is permanently OS-visible — see `hide`'s doc comment).
 fn set_tool_window_style(hwnd: HWND) {
     unsafe {
         let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | WS_EX_TOOLWINDOW.0 as isize);
+        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | (WS_EX_TOOLWINDOW.0 as isize));
     }
 }
 
-/// The "go invisible" step of startup layered-window priming (`LayeredPrimeState`).
-/// Temporarily sets `WS_EX_LAYERED` and alpha 0.
-///
-/// An earlier design left `WS_EX_LAYERED` set permanently once turned on, but
-/// real-hardware testing found a separate issue that design didn't catch: during the
-/// priming window, the real white DWM placeholder was exposed regardless of alpha —
-/// static-presence testing alone only covers "how it looks during normal display,"
-/// not "the very first real on-screen composite after process start." This function
-/// goes back to toggling `WS_EX_LAYERED` on only for the duration it's needed,
-/// cleared by `exit_layered` once the window is confirmed off-screen (see
-/// `LayeredPrimeState::WaitOffscreen`) — the ordering fix described in
-/// `LayeredPrimeState`'s doc comment.
-fn enter_layered_invisible(hwnd: HWND) {
+fn move_window(hwnd: HWND, x: i32, y: i32) {
     unsafe {
-        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current | WS_EX_LAYERED.0 as isize);
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
-    }
-}
-
-/// The counterpart to `enter_layered_invisible`: clears the `WS_EX_LAYERED` bit,
-/// returning to a normal (always-opaque) window. Callers (`LayeredPrimeState::WaitOffscreen`)
-/// only call this after `window_is_offscreen` confirms arrival off-screen, avoiding
-/// the ordering bug of restoring opacity while still on-screen (see
-/// `LayeredPrimeState`'s doc comment).
-fn exit_layered(hwnd: HWND) {
-    unsafe {
-        let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let _ = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, current & !(WS_EX_LAYERED.0 as isize));
-    }
-}
-
-/// Confirms via `GetWindowRect` whether the window has actually (at the OS level)
-/// moved to roughly `OFFSCREEN_POSITION`. `ViewportCommand::OuterPosition` applies
-/// with a delay through egui/winit's command queue, so the frame right after sending
-/// it may still observe the old position (see `LayeredPrimeState::WaitOffscreen`'s
-/// doc comment). Rather than requiring an exact match with `OFFSCREEN_POSITION`,
-/// this checks against a threshold (`-4000`) that normal monitor layouts would never
-/// reach.
-fn window_is_offscreen(hwnd: HWND) -> bool {
-    let mut rect = RECT::default();
-    let ok = unsafe { GetWindowRect(hwnd, &mut rect) }.is_ok();
-    ok && rect.left < -4000
-}
-
-fn apply_theme(ctx: &egui::Context, theme: Theme) {
-    let preference = match theme {
-        Theme::Light => egui::ThemePreference::Light,
-        Theme::Dark => egui::ThemePreference::Dark,
-        Theme::System => egui::ThemePreference::System,
-    };
-    ctx.set_theme(preference);
-}
-
-impl eframe::App for IssenApp {
-    /// `eframe`'s default `clear_color` (a translucent solid dark gray) would leave
-    /// a faint tint outside `ui_chrome::glass_panel`'s rounded corners, muddying what
-    /// should be fully transparent. Using full transparency (alpha 0) instead leaves
-    /// the panel's look entirely up to `glass_panel`'s own drawing (verified on real
-    /// hardware; see docs/architecture/ui-appearance.md).
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        [0.0, 0.0, 0.0, 0.0]
-    }
-
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Consume whatever `handle_tray_action` queued in the previous frame, once,
-        // at the very start of this function (before tray-event handling below).
-        // Keeping the consume and the enqueue in separate places like this ensures a
-        // pending action newly queued in this same frame doesn't get processed
-        // within the same frame it was queued (see `handle_tray_action`'s doc comment).
-        if let Some(pending) = self.pending_open.take() {
-            match pending {
-                PendingOpen::Settings => self.settings.open(),
-                PendingOpen::About => self.about_open = true,
-            }
-        }
-
-        if self.hotkey.try_recv_toggle() {
-            self.set_visible(ctx, true);
-        }
-
-        self.tick_layered_prime(ctx);
-
-        // Test-only auto-show toggle (see `debug_auto_cycle`'s doc comment).
-        if let Some((interval, next_toggle)) = self.debug_auto_cycle {
-            if Instant::now() >= next_toggle {
-                let now_visible = self.visible;
-                self.set_visible(ctx, !now_visible);
-                self.debug_auto_cycle = Some((interval, Instant::now() + interval));
-            }
-            ctx.request_repaint_after(Duration::from_millis(16));
-        }
-
-        // Test-only delayed first show (see `debug_delayed_show`'s doc comment).
-        // Never calls `request_repaint_after` while waiting, so the loop genuinely sleeps.
-        if let Some(rx) = &self.debug_delayed_show {
-            if rx.try_recv().is_ok() {
-                self.set_visible(ctx, true);
-                self.debug_delayed_show = None;
-            }
-        }
-
-        // `i.focused` doesn't update while hidden — it stays at the last visible
-        // frame's value (which is itself the reason it went hidden, so checking it
-        // here would immediately re-hide the window one frame after showing it). To
-        // catch only the actual "moment" focus is lost, this checks the
-        // `WindowFocused(false)` event rather than polling.
-        let lost_focus = ctx.input(|i| {
-            i.events
-                .iter()
-                .any(|event| matches!(event, egui::Event::WindowFocused(false)))
-        });
-        if lost_focus && !self.settings.is_open() && !self.about_open && !self.tools.is_open() {
-            self.set_visible(ctx, false);
-        }
-
-        // Esc closes the main window. Checked before the history-panel early return
-        // below so it still works while that panel is open.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.set_visible(ctx, false);
-        }
-
-        if let Some(action) = self.tray.try_recv_action() {
-            self.handle_tray_action(ctx, action);
-        }
-
-        self.poll_scan();
-        if self.settings.take_rescan_requested() {
-            self.start_scan();
-        }
-        if self.settings.take_save_requested() {
-            if let Err(err) = self.config.save(config::APP_NAME) {
-                eprintln!("issen: failed to save config.toml: {err}");
-            }
-        }
-        self.apply_language(ctx);
-        self.apply_hotkey_change();
-        self.apply_font_scale(ctx);
-        self.apply_ui_font(ctx);
-        if self.pending_scan.is_none() && Instant::now() >= self.next_periodic_scan {
-            self.start_scan();
-        }
-        // Redraw every frame for the duration of the fade-in/scale animation
-        // (`SHOW_ANIM_DURATION`). Requesting a short interval here composes fine
-        // with the `request_repaint_after(next_wake)` call below, since egui takes
-        // the minimum of multiple requests within a frame.
-        if self
-            .show_anim_start
-            .is_some_and(|start| start.elapsed() < SHOW_ANIM_DURATION)
-        {
-            ctx.request_repaint();
-        }
-
-        // Wake up frequently while a scan is running so completion is caught
-        // promptly; while idle, sleep in one jump until the next periodic rescan is
-        // due (a scheduled wake via a timer, not polling).
-        let next_wake = if self.pending_scan.is_some() {
-            Duration::from_millis(150)
-        } else {
-            self.next_periodic_scan
-                .saturating_duration_since(Instant::now())
-                .max(Duration::from_secs(1))
-        };
-        ctx.request_repaint_after(next_wake);
-
-        // While the query-history panel (🕘) is open, suspend keyboard handling for
-        // the normal search results (up/down, Enter, Alt+digit). `self.results`
-        // stays stale (from the last real search) while the panel is open, so acting
-        // on it here would run something unrelated to what's actually on screen.
-        if self.history_panel_open {
-            return;
-        }
-
-        let (up, down) = ctx.input(|i| {
-            (
-                i.key_pressed(egui::Key::ArrowUp),
-                i.key_pressed(egui::Key::ArrowDown),
-            )
-        });
-        if down && !self.results.is_empty() {
-            self.selected = (self.selected + 1).min(self.results.len() - 1);
-            self.pending_scroll_to_selected = true;
-        }
-        if up {
-            self.selected = self.selected.saturating_sub(1);
-            self.pending_scroll_to_selected = true;
-        }
-
-        let (enter, admin, open_location, copy_path) = ctx.input(|i| {
-            let enter_pressed = i.key_pressed(egui::Key::Enter);
-            let mods = i.modifiers;
-            (
-                enter_pressed && !(mods.ctrl && mods.shift),
-                enter_pressed && mods.ctrl && mods.shift,
-                mods.ctrl && mods.shift && i.key_pressed(egui::Key::E),
-                mods.ctrl && !mods.shift && i.key_pressed(egui::Key::C),
-            )
-        });
-        if admin {
-            self.run_result_action(ctx, ResultActionKind::RunAsAdmin);
-        } else if enter {
-            self.run_result_action(ctx, ResultActionKind::Default);
-        }
-        if open_location {
-            self.run_result_action(ctx, ResultActionKind::OpenLocation);
-        }
-        if copy_path {
-            self.run_result_action(ctx, ResultActionKind::CopyPath);
-        }
-
-        // Alt+2 through Alt+9 select and run a visible result directly (see
-        // docs/architecture/hotkey-input.md). The global hotkey `Alt+Space` is a
-        // separate OS-level path via `RegisterHotKey` (`src/hotkey.rs`), so it can't
-        // conflict with these in-app `Alt+digit` shortcuts. This range deliberately
-        // ignores scroll position, covering only the first `visible_rows_cap()` rows
-        // visible without scrolling (following the scrolled viewport would add
-        // complexity for little benefit). The first row is already reachable via
-        // `Enter` alone, so while pressing `Alt+1` is harmless given how
-        // `DIGIT_KEYS` is laid out, no distinct meaning is assigned to it.
-        const DIGIT_KEYS: [egui::Key; 9] = [
-            egui::Key::Num1,
-            egui::Key::Num2,
-            egui::Key::Num3,
-            egui::Key::Num4,
-            egui::Key::Num5,
-            egui::Key::Num6,
-            egui::Key::Num7,
-            egui::Key::Num8,
-            egui::Key::Num9,
-        ];
-        let alt_digit = ctx.input(|i| {
-            if !i.modifiers.alt {
-                return None;
-            }
-            DIGIT_KEYS.iter().position(|key| i.key_pressed(*key))
-        });
-        if let Some(idx) = alt_digit {
-            let visible_rows = self.results.len().min(self.visible_rows_cap());
-            if idx < visible_rows {
-                self.selected = idx;
-                self.run_result_action(ctx, ResultActionKind::Default);
-            }
-        }
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(egui::Color32::TRANSPARENT))
-            .show(ui, |ui| {
-                // The input box always stays on a fixed dark, glass-style background
-                // (see docs/architecture/window-lifecycle.md), so text
-                // color is forced to a light palette even in light theme — a
-                // theme-derived dark text color would blend into the fixed dark
-                // background and become unreadable.
-                *ui.visuals_mut() = egui::Visuals::dark();
-
-                let full_rect = ui.available_rect_before_wrap();
-
-                // Show animation (fade-in + scale). See `SHOW_ANIM_DURATION`'s doc
-                // comment. Because `set_visible` resets search state (and thus zero
-                // results) on every show, `full_rect`'s height at this point is
-                // always just the input row (`MAIN_WINDOW_SIZE.1`), and the pivot
-                // for scaling is its center.
-                let anim_t = self.show_anim_start.map(|start| {
-                    (start.elapsed().as_secs_f32() / SHOW_ANIM_DURATION.as_secs_f32()).min(1.0)
-                });
-                if let Some(t) = anim_t {
-                    // Ease-out cubic: fast start, smooth settle.
-                    let eased = 1.0 - (1.0 - t).powi(3);
-                    ui.set_opacity(eased);
-                    let scale = SHOW_ANIM_SCALE_FROM + (1.0 - SHOW_ANIM_SCALE_FROM) * eased;
-                    let pivot = egui::pos2(
-                        full_rect.center().x,
-                        full_rect.top() + MAIN_WINDOW_SIZE.1 / 2.0,
-                    );
-                    let transform =
-                        egui::emath::TSTransform::new(pivot.to_vec2() * (1.0 - scale), scale);
-                    ctx.set_transform_layer(egui::LayerId::background(), transform);
-                    if t >= 1.0 {
-                        self.show_anim_start = None;
-                    }
-                } else {
-                    ctx.set_transform_layer(
-                        egui::LayerId::background(),
-                        egui::emath::TSTransform::IDENTITY,
-                    );
-                }
-
-                let accent = crate::ui_chrome::accent_color(self.config.accent_color);
-                let glass = crate::ui_chrome::palette(true);
-                crate::ui_chrome::glass_panel(ui, full_rect, &glass);
-                // `sync_window_height` computes window height as input row
-                // (`MAIN_WINDOW_SIZE.1`) + row count * `RESULT_ROW_HEIGHT`, without
-                // accounting for `item_spacing` between rows. Left at egui's default
-                // vertical spacing, that gap would accumulate and push the last row
-                // out of the computed height, so vertical spacing alone is zeroed to
-                // pack rows with no gap (horizontal spacing is left alone — the
-                // toolbar buttons need it).
-                ui.spacing_mut().item_spacing.y = 0.0;
-
-                // `with_decorations(false)` (`main.rs`) means there's no OS title
-                // bar to drag, so the input row (`MAIN_WINDOW_SIZE.1` tall, acting as
-                // a pseudo title bar) doubles as the drag handle wherever it isn't
-                // covered by the text field or buttons (the `TextEdit` is vertically
-                // centered, leaving thin margins above and below). The search-results
-                // dropdown area (the part `sync_window_height` grows) is deliberately
-                // excluded — including it would let the background's
-                // `Sense::drag()` region claim the same full-row-height space as a
-                // result row's `Sense::click()`, resolving as a drag before a click
-                // could launch anything. This `interact` call runs before the other
-                // widgets placed over the same rect, so it doesn't interfere with
-                // their own click handling (egui gives input-handling priority to
-                // whichever widget on a layer was added later).
-                let drag_rect = egui::Rect::from_min_size(
-                    full_rect.min,
-                    egui::vec2(full_rect.width(), MAIN_WINDOW_SIZE.1),
-                );
-                // `Sense::drag()` alone never resolves egui's internal "click" events
-                // (including `secondary_clicked()`) — egui only resolves click-type
-                // events for widgets whose `Sense` includes clicking. Right-click
-                // needs to open the context menu too, so this uses `click_and_drag()`.
-                let drag_response = ui
-                    .interact(
-                        drag_rect,
-                        ui.id().with("drag-bg"),
-                        egui::Sense::click_and_drag(),
-                    )
-                    // Switch the cursor to a move icon on hover/drag so the
-                    // draggable area is discoverable at a glance — the background
-                    // stays a plain black fill, so a static border wasn't used, just
-                    // the cursor shape.
-                    .on_hover_and_drag_cursor(egui::CursorIcon::Move);
-                if drag_response.drag_started_by(egui::PointerButton::Primary) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                drag_response.context_menu(|ui| self.show_main_context_menu(ui));
-
-                // Accent bar on the input row's left edge (part of the reference
-                // design). The visible fill is drawn via `painter`; layout reserves
-                // the same width via `add_space`.
-                let accent_bar_w = 3.0;
-                let accent_bar_rect = egui::Rect::from_center_size(
-                    egui::pos2(
-                        full_rect.left() + CONTENT_PADDING + accent_bar_w / 2.0,
-                        full_rect.top() + MAIN_WINDOW_SIZE.1 / 2.0,
-                    ),
-                    egui::vec2(accent_bar_w, 28.0),
-                );
-                for (expand, alpha) in [(9.0, 24u8), (4.0, 55)] {
-                    ui.painter().rect_filled(
-                        accent_bar_rect.expand(expand),
-                        4.0,
-                        egui::Color32::from_rgba_unmultiplied(
-                            accent.r(),
-                            accent.g(),
-                            accent.b(),
-                            alpha,
-                        ),
-                    );
-                }
-                ui.painter().rect_filled(accent_bar_rect, 1.5, accent);
-
-                let toolbar_width = 3.0 * 28.0 + CONTENT_PADDING;
-                let response = ui
-                    .horizontal(|ui| {
-                        // Expanding the row's minimum height to fill the whole input
-                        // area lets `horizontal`'s default vertical `Align::Center`
-                        // put the naturally sized `TextEdit` in the row's center
-                        // (previously a fixed 40px rect was used inside the full
-                        // 60px window, leaving the text drawn too high). Height is
-                        // deliberately not fixed via `add_sized` — only
-                        // `desired_width` constrains the width.
-                        ui.set_min_height(MAIN_WINDOW_SIZE.1);
-                        // Left: room for the accent bar. Right: margin from the
-                        // window edge (reserved manually here since `CentralPanel`'s
-                        // own margin was zeroed to let the glass-panel background
-                        // paint edge-to-edge).
-                        ui.add_space(CONTENT_PADDING + accent_bar_w + 14.0);
-                        let input_font = egui::FontId::proportional(20.0 * self.config.font_scale);
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut self.query)
-                                // `hint_text` builds its own Atom for the
-                                // placeholder and doesn't inherit the font set via
-                                // `TextEdit::font` — egui 0.36's `AtomLayout` only
-                                // applies `fallback_font` (the default
-                                // `TextStyle::Body`) to an Atom with no font of its
-                                // own. Without an explicit `FontId` here, the
-                                // placeholder and the actual typed text end up at
-                                // different sizes/baselines, so the same `FontId` is
-                                // set explicitly via `RichText` to keep them matched.
-                                .hint_text(
-                                    egui::RichText::new(self.strings.search_hint)
-                                        .font(input_font.clone()),
-                                )
-                                .frame(egui::Frame::NONE)
-                                .font(input_font)
-                                .desired_width(ui.available_width() - toolbar_width),
-                        );
-                        if ui
-                            .button("🎨")
-                            .on_hover_text(self.strings.tool_color_picker)
-                            .clicked()
-                        {
-                            self.tools.toggle(crate::tools::ToolKind::ColorPicker);
-                        }
-                        if ui
-                            .button("📐")
-                            .on_hover_text(self.strings.tool_unit_converter)
-                            .clicked()
-                        {
-                            self.tools.toggle(crate::tools::ToolKind::UnitConverter);
-                        }
-                        if ui
-                            .button("🕘")
-                            .on_hover_text(self.strings.tool_history)
-                            .clicked()
-                        {
-                            self.history_panel_open = !self.history_panel_open;
-                        }
-                        ui.add_space(CONTENT_PADDING - 8.0);
-                        response
-                    })
-                    .inner;
-                // `TextEdit` normally claims left-drag for text selection (egui's
-                // standard `Sense::click_and_drag()`), so the window usually can't be
-                // dragged from on top of the text box. When the query is empty (no
-                // selectable text, so drag can't conflict with text selection),
-                // the `TextEdit`'s own drag detection is repurposed for window
-                // dragging instead — while any query is typed, text selection still
-                // takes priority as before.
-                if self.query.is_empty() && response.drag_started_by(egui::PointerButton::Primary) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                // Don't steal focus from a tool popup's (e.g. the unit converter's)
-                // own text input while one is open.
-                if !self.tools.is_open() {
-                    response.request_focus();
-                }
-                response.context_menu(|ui| self.show_main_context_menu(ui));
-
-                if response.changed() {
-                    // Switch back to the normal search results, not the history
-                    // panel, as soon as the query is edited (showing both search
-                    // results and history at once would be confusing).
-                    self.history_panel_open = false;
-                    self.run_search();
-                }
-
-                if self.history_panel_open {
-                    // `sync_window_height`/`apply_theme` still run once, in their
-                    // usual place, after this `CentralPanel` closure returns (this
-                    // `return` only exits the closure, not the whole `ui()` call).
-                    // The early return here is only to skip drawing the normal
-                    // search-result list below.
-                    self.show_history_panel(ui);
-                    return;
-                }
-
-                // The dropdown-style results area. The window's own height is sized
-                // by `sync_window_height` to fit `visible_rows_cap()` rows without
-                // scrolling. `self.results` itself holds more than that (up to
-                // `RESULT_RETENTION_CAP`), so anything beyond the visible cap is
-                // reachable via the `ScrollArea` below.
-                let visible_rows_cap = self.visible_rows_cap();
-                let scroll_height =
-                    self.results.len().min(visible_rows_cap) as f32 * RESULT_ROW_HEIGHT;
-                // `search_generation` (used as `id_salt`) changes on every query
-                // change, so egui treats this as a fresh scroll area each time and
-                // always starts scrolled to the top rather than keeping the previous
-                // manual scroll position (see `run_search`'s comment).
-                //
-                // Actions triggered by clicking a result or its right-click menu
-                // (running it, registering an alias, unpinning) are only queued
-                // here, not executed inside this `for` loop. These actions can
-                // mutate `self.results`/`self.query` via `self.run_result_action`
-                // (e.g. a successful launch resets the whole search state through
-                // `set_visible` when the window closes). Since `for i in
-                // 0..self.results.len()` iterates up to the count captured when the
-                // loop started, a mid-loop change to `self.results`'s length makes
-                // the next `self.results[i]` access go out of bounds — this
-                // reproduced as an actual panic
-                // (`index out of bounds: the len is 0 but the index is 1`) when
-                // searching for and clicking a result to launch it.
-                let mut pending_row_action: Option<(usize, RowMenuAction)> = None;
-                egui::ScrollArea::vertical()
-                    .id_salt(("results-scroll", self.search_generation))
-                    .max_height(scroll_height)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for i in 0..self.results.len() {
-                            let result = &self.results[i];
-                            let row_id = ui.id().with(("result_row", i));
-                            let is_selected = i == self.selected;
-                            // `run_search` only adds `HISTORY_SCORE_BOOST` to pinned
-                            // results (a value ordinary fuzzy-match scores can never
-                            // reach), so checking the score magnitude here is enough
-                            // — no need to recompute `target_key` and look it up in
-                            // `History` again.
-                            let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
-                            let bg = if is_selected {
-                                RESULT_SELECTED_BG
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            let row = egui::Frame::default()
-                                .fill(bg)
-                                .corner_radius(10.0)
-                                .inner_margin(egui::Margin::symmetric(
-                                    CONTENT_PADDING as i8 + 10,
-                                    0,
-                                ))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        // `set_min_height` must be called inside
-                                        // `ui.horizontal`, not around it as part of
-                                        // the outer vertical layout. Called from
-                                        // outside, the vertical layout's default
-                                        // top alignment (`Align::Min`) leaves the
-                                        // extra height as blank space below the text
-                                        // row instead, so the row's contents stay
-                                        // top-aligned (misaligned against the
-                                        // vertically centered selection bar drawn
-                                        // through the row's middle). Same pattern as
-                                        // the main search input row (this file):
-                                        // calling it inside `horizontal` itself lets
-                                        // the default `Align::Center` take effect.
-                                        ui.set_min_height(RESULT_ROW_HEIGHT);
-                                        // Reserve space so this doesn't overlap the
-                                        // `Alt+N` hint chip drawn on the right (via
-                                        // `painter`, using `row.rect`, after this
-                                        // `Frame::show` completes).
-                                        ui.set_width(
-                                            ui.available_width() - HINT_CHIP_RESERVED_WIDTH,
-                                        );
-                                        if is_pinned {
-                                            ui.label(
-                                                egui::RichText::new("\u{1F4CC}")
-                                                    .color(accent)
-                                                    .size(11.0),
-                                            );
-                                        }
-                                        if is_selected {
-                                            ui.colored_label(accent, &result.title);
-                                        } else {
-                                            ui.label(&result.title);
-                                        }
-                                        ui.add(egui::Label::new(&result.subtitle).truncate());
-                                    });
-                                })
-                                .response;
-                            if is_selected {
-                                let bar_rect = egui::Rect::from_center_size(
-                                    egui::pos2(
-                                        row.rect.left() + CONTENT_PADDING,
-                                        row.rect.center().y,
-                                    ),
-                                    egui::vec2(2.0, RESULT_ROW_HEIGHT - 20.0),
-                                );
-                                ui.painter().rect_filled(bar_rect, 1.0, accent);
-                            }
-                            // Hint chip showing that `Alt+2` through `Alt+9` selects
-                            // and runs this row directly (matches the Alt+digit
-                            // handling in `logic()`). That shortcut ignores scroll
-                            // position and only covers the visible-without-scrolling
-                            // `visible_rows_cap` rows, so the chip is drawn only
-                            // within that same range (see `logic()`'s comment). The
-                            // first row (`i == 0`) is already reachable via `Enter`
-                            // alone, so it shows `⏎` instead — no distinct `Alt+1`
-                            // is assigned since it would just duplicate `Enter`.
-                            if i < visible_rows_cap {
-                                let hint = if i == 0 {
-                                    "\u{23ce}".to_string()
-                                } else {
-                                    format!("Alt+{}", i + 1)
-                                };
-                                let chip_w = 14.0 + hint.chars().count() as f32 * 6.0;
-                                let chip_rect = egui::Rect::from_center_size(
-                                    egui::pos2(
-                                        row.rect.right() - CONTENT_PADDING - chip_w / 2.0,
-                                        row.rect.center().y,
-                                    ),
-                                    egui::vec2(chip_w, 20.0),
-                                );
-                                ui.painter().rect_filled(
-                                    chip_rect,
-                                    6.0,
-                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
-                                );
-                                ui.painter().text(
-                                    chip_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    hint,
-                                    egui::FontId::monospace(10.0),
-                                    if is_selected {
-                                        glass.text
-                                    } else {
-                                        glass.subtext
-                                    },
-                                );
-                            }
-                            let row = ui.interact(row.rect, row_id, egui::Sense::click());
-                            // Right after a key action (up/down) scrolls the
-                            // selected row out of view, pull it back into range once
-                            // (see `pending_scroll_to_selected`'s doc comment).
-                            // Calling this every frame during a manual mouse scroll
-                            // would fight the user's own scrolling, so it's limited
-                            // to the one frame right after selection changes.
-                            if is_selected && self.pending_scroll_to_selected {
-                                row.scroll_to_me(Some(egui::Align::Center));
-                                self.pending_scroll_to_selected = false;
-                            }
-                            let is_file_action =
-                                matches!(self.results[i].action, Action::Launch { .. });
-
-                            if row.clicked() {
-                                self.selected = i;
-                                pending_row_action =
-                                    Some((i, RowMenuAction::Run(ResultActionKind::Default)));
-                            }
-
-                            row.context_menu(|ui| {
-                                self.selected = i;
-                                if ui.button(self.strings.action_run).clicked() {
-                                    pending_row_action =
-                                        Some((i, RowMenuAction::Run(ResultActionKind::Default)));
-                                    ui.close();
-                                }
-                                if is_file_action {
-                                    if ui.button(self.strings.action_run_as_admin).clicked() {
-                                        pending_row_action = Some((
-                                            i,
-                                            RowMenuAction::Run(ResultActionKind::RunAsAdmin),
-                                        ));
-                                        ui.close();
-                                    }
-                                    if ui.button(self.strings.action_open_location).clicked() {
-                                        pending_row_action = Some((
-                                            i,
-                                            RowMenuAction::Run(ResultActionKind::OpenLocation),
-                                        ));
-                                        ui.close();
-                                    }
-                                    if ui.button(self.strings.action_copy_path).clicked() {
-                                        pending_row_action = Some((
-                                            i,
-                                            RowMenuAction::Run(ResultActionKind::CopyPath),
-                                        ));
-                                        ui.close();
-                                    }
-                                }
-                                if ui.button(self.strings.action_register_alias).clicked() {
-                                    pending_row_action = Some((i, RowMenuAction::RegisterAlias));
-                                    ui.close();
-                                }
-                                // Show "pin" or "unpin" depending on whether this
-                                // result is already pinned (unpin is only offered
-                                // for results already boosted from a past selection).
-                                if is_pinned {
-                                    if ui.button(self.strings.action_unpin).clicked() {
-                                        pending_row_action = Some((i, RowMenuAction::Unpin));
-                                        ui.close();
-                                    }
-                                } else if ui.button(self.strings.action_pin).clicked() {
-                                    pending_row_action = Some((i, RowMenuAction::Pin));
-                                    ui.close();
-                                }
-                            });
-                        }
-                    });
-
-                // Only after the whole results list has finished drawing is the one
-                // queued action actually run (see `pending_row_action`'s doc
-                // comment — by this point, nothing later in this frame still reads
-                // `self.results[i]`, so it's safe to mutate `self.results` here).
-                if let Some((idx, action)) = pending_row_action {
-                    self.selected = idx;
-                    match action {
-                        RowMenuAction::Run(kind) => self.run_result_action(&ctx, kind),
-                        RowMenuAction::RegisterAlias => self.register_selected_as_alias(),
-                        RowMenuAction::Pin => {
-                            if let Some(result) = self.results.get(idx) {
-                                let key = crate::search::target_key(&result.action);
-                                self.history.pin(&key);
-                                if let Err(err) = self.history.save(config::APP_NAME) {
-                                    eprintln!("issen: failed to save history.toml: {err}");
-                                }
-                            }
-                            // Rebuild via `run_search`, same as Unpin, so the new
-                            // pinned ranking is reflected correctly right away.
-                            self.run_search();
-                        }
-                        RowMenuAction::Unpin => {
-                            if let Some(result) = self.results.get(idx) {
-                                let key = crate::search::target_key(&result.action);
-                                self.history.remove(&key);
-                                if let Err(err) = self.history.save(config::APP_NAME) {
-                                    eprintln!("issen: failed to save history.toml: {err}");
-                                }
-                            }
-                            // Rebuild via the normal search path (`run_search`)
-                            // rather than patching the score in place, so the
-                            // post-unpin ranking is correct. Safe even if the
-                            // result count changes, since this runs after the loop.
-                            self.run_search();
-                        }
-                    }
-                }
-            });
-
-        self.sync_window_height(&ctx);
-        apply_theme(&ctx, self.config.theme);
-
-        self.settings.show(
-            &ctx,
-            self.strings,
-            self.lang,
-            &mut self.config,
-            self.last_scan_finished,
-            self.last_scan_count,
-            self.pending_scan.is_some(),
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
-
-        show_about_window(&ctx, self.strings, &mut self.about_open);
-
-        self.tools.show(&ctx, self.strings);
     }
 }
 
-fn show_about_window(ctx: &egui::Context, strings: &'static Strings, open: &mut bool) {
-    if !*open {
+/// Whether `hwnd` is the OS's current foreground window right now. Used by
+/// `show()` to seed `seen_active_since_show` without waiting for an
+/// activation event — see that call site's doc comment for why an event
+/// alone isn't always enough.
+fn window_is_foreground(hwnd: HWND) -> bool {
+    unsafe { GetForegroundWindow() == hwnd }
+}
+
+/// Whether `hwnd` is the *calling thread's* active window right now — a
+/// distinct concept from [`window_is_foreground`] (system-wide). `gpui`'s
+/// `activate()` calls `SetActiveWindow` before `SetForegroundWindow`, and
+/// `SetActiveWindow` fires `WM_ACTIVATE(true)` only on a real transition —
+/// it's a silent no-op (no event) if `hwnd` is already this thread's active
+/// window. Diagnostic-only (see `focus_trace`), used to tell that scenario
+/// apart from a genuine `SetForegroundWindow` failure.
+fn window_is_thread_active(hwnd: HWND) -> bool {
+    unsafe { GetActiveWindow() == hwnd }
+}
+
+/// Temporary diagnostic tracing for the focus-loss auto-hide bug (reported
+/// 2026-09-08: window sometimes fails to hide after losing OS focus).
+/// Dormant unless `ISSEN_DEBUG_FOCUS_TRACE` is set, matching this project's
+/// other `ISSEN_DEBUG_*` investigation hooks. Writes to a file rather than
+/// stderr since release-shaped runs may not have a console attached.
+fn focus_trace(msg: std::fmt::Arguments) {
+    if std::env::var_os("ISSEN_DEBUG_FOCUS_TRACE").is_none() {
         return;
     }
-
-    let mut still_open = true;
-    ctx.show_viewport_immediate(
-        egui::ViewportId::from_hash_of("issen-about"),
-        egui::ViewportBuilder::default()
-            .with_title(strings.about_title)
-            .with_inner_size([320.0, 140.0])
-            .with_resizable(false)
-            // Without this, the about window would always end up behind the main
-            // window, since the main window is `with_always_on_top()` (same reason
-            // as in `settings_window.rs`).
-            .with_always_on_top(),
-        |ui, _class| {
-            if ui.ctx().input(|i| i.viewport().close_requested()) {
-                still_open = false;
-            }
-            egui::CentralPanel::default().show(ui, |ui| {
-                ui.heading(config::APP_NAME);
-                ui.label(i18n::about_version_text(
-                    i18n::lang_of(strings),
-                    env!("CARGO_PKG_VERSION"),
-                ));
-                ui.add_space(12.0);
-                if ui.button(strings.about_close).clicked() {
-                    still_open = false;
-                }
-            });
-        },
-    );
-    *open = still_open;
-    if *open {
-        ctx.request_repaint();
+    use std::io::Write as _;
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    let elapsed_ms = start.elapsed().as_millis();
+    let path = std::env::temp_dir().join("issen-focus-trace.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "[{elapsed_ms:>8}ms] {msg}");
     }
+}
+
+/// App entry point, called from `main.rs`.
+pub fn run(config: Config) {
+    let strings = Strings::for_lang(i18n::resolve(config.language));
+    let tray = TrayHandle::new(strings).expect("failed to create tray icon");
+    let (hotkey, hotkey_rx) = HotkeyListener::spawn(config.hotkey.clone());
+    let menu_rx = tray::take_menu_event_receiver();
+    let icon_rx = tray::take_tray_icon_event_receiver();
+
+    application().run(move |cx: &mut App| {
+        cx.bind_keys([
+            KeyBinding::new("up", MoveUp, Some(KEY_CONTEXT)),
+            KeyBinding::new("down", MoveDown, Some(KEY_CONTEXT)),
+            KeyBinding::new("enter", Confirm, Some(KEY_CONTEXT)),
+            KeyBinding::new("ctrl-shift-enter", RunAsAdminAction, Some(KEY_CONTEXT)),
+            KeyBinding::new("ctrl-shift-e", OpenLocationAction, Some(KEY_CONTEXT)),
+            KeyBinding::new("escape", EscapeAction, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-1", AltNum1, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-2", AltNum2, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-3", AltNum3, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-4", AltNum4, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-5", AltNum5, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-6", AltNum6, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-7", AltNum7, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-8", AltNum8, Some(KEY_CONTEXT)),
+            KeyBinding::new("alt-9", AltNum9, Some(KEY_CONTEXT)),
+            KeyBinding::new("backspace", Backspace, Some(KEY_CONTEXT)),
+            KeyBinding::new("delete", Delete, Some(KEY_CONTEXT)),
+            KeyBinding::new("left", Left, Some(KEY_CONTEXT)),
+            KeyBinding::new("right", Right, Some(KEY_CONTEXT)),
+            KeyBinding::new("shift-left", SelectLeft, Some(KEY_CONTEXT)),
+            KeyBinding::new("shift-right", SelectRight, Some(KEY_CONTEXT)),
+            KeyBinding::new("ctrl-a", SelectAll, Some(KEY_CONTEXT)),
+            KeyBinding::new("home", Home, Some(KEY_CONTEXT)),
+            KeyBinding::new("end", End, Some(KEY_CONTEXT)),
+            KeyBinding::new("ctrl-v", Paste, Some(KEY_CONTEXT)),
+            KeyBinding::new("ctrl-x", Cut, Some(KEY_CONTEXT)),
+            KeyBinding::new("ctrl-c", Copy, Some(KEY_CONTEXT)),
+        ]);
+        cx.bind_keys(crate::text_input::key_bindings());
+
+        let bounds = Bounds {
+            origin: gpui::point(px(OFFSCREEN_POSITION.0), px(OFFSCREEN_POSITION.1)),
+            size: size(px(MAIN_WINDOW_SIZE.0), px(MAIN_WINDOW_SIZE.1)),
+        };
+
+        let window_handle = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: None,
+                    focus: true,
+                    show: true,
+                    kind: WindowKind::PopUp,
+                    // `true` so the search box's own drag region
+                    // (`WindowControlArea::Drag`, see `render`'s
+                    // `search_box`) can actually move the window — on
+                    // Windows, `is_movable: false` disables the OS-level
+                    // `HTCAPTION` hit-test regardless of what the app marks
+                    // as a drag area (`gpui_windows`'s `handle_hit_test_msg`).
+                    is_movable: true,
+                    window_background: WindowBackgroundAppearance::Transparent,
+                    ..Default::default()
+                },
+                {
+                    let config = config.clone();
+                    move |window, cx| cx.new(|cx| IssenApp::new(window, cx, config, hotkey, tray))
+                },
+            )
+            .expect("failed to open main window");
+
+        // Event-driven hotkey/tray wake-up: each of these tasks blocks on its
+        // channel (no `request_animation_frame` polling — see the module doc
+        // comment) and, once woken, updates the window and lets GPUI's own
+        // render scheduling take it from there.
+        {
+            let mut hotkey_rx = hotkey_rx;
+            cx.spawn(async move |cx| {
+                while hotkey_rx.next().await.is_some() {
+                    let _ = window_handle.update(cx, |view, window, cx| view.show(window, cx));
+                }
+            })
+            .detach();
+        }
+        if let Some(mut menu_rx) = menu_rx {
+            cx.spawn(async move |cx| {
+                while let Some(event) = menu_rx.next().await {
+                    let _ = window_handle.update(cx, |view, window, cx| {
+                        if let Some(action) = view.tray.match_menu_action(&event) {
+                            view.handle_tray_action(action, window, cx);
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+        if let Some(mut icon_rx) = icon_rx {
+            cx.spawn(async move |cx| {
+                while let Some(event) = icon_rx.next().await {
+                    if let Some(action) = TrayHandle::match_tray_icon_action(&event) {
+                        let _ = window_handle.update(cx, |view, window, cx| {
+                            view.handle_tray_action(action, window, cx)
+                        });
+                    }
+                }
+            })
+            .detach();
+        }
+
+        // Shows the main window at startup via the real `show()` path (OS
+        // activation, `visible = true`, the focus-loss observer's guard
+        // reset — everything a real hotkey press does), for verifying
+        // show()-dependent behavior (focus-on-show, focus-loss auto-hide,
+        // drag) without needing to synthesize the actual global hotkey.
+        if std::env::var_os("ISSEN_DEBUG_SHOW").is_some() {
+            let _ = window_handle.update(cx, |view, window, cx| view.show(window, cx));
+        }
+
+        // Opens the about window at startup, via the same tray-action path a
+        // real click takes, for manual visual verification without needing
+        // tray-icon UI automation.
+        if std::env::var_os("ISSEN_DEBUG_OPEN_ABOUT").is_some() {
+            let _ = window_handle.update(cx, |view, window, cx| {
+                view.handle_tray_action(TrayAction::About, window, cx)
+            });
+        }
+        if std::env::var_os("ISSEN_DEBUG_OPEN_SETTINGS").is_some() {
+            let _ = window_handle.update(cx, |view, window, cx| {
+                view.handle_tray_action(TrayAction::Settings, window, cx)
+            });
+        }
+        // Tools has no tray menu entry (only reachable via the search box's
+        // toolbar buttons in normal use), so this is the only way to open
+        // it for verification without driving mouse input.
+        let debug_tool = match std::env::var("ISSEN_DEBUG_OPEN_TOOL").as_deref() {
+            Ok("color-picker") => Some(ToolKind::ColorPicker),
+            Ok("unit-converter") => Some(ToolKind::UnitConverter),
+            _ => None,
+        };
+        if let Some(kind) = debug_tool {
+            let _ = window_handle.update(cx, |view, window, cx| {
+                view.show(window, cx);
+                view.toggle_tool(kind, cx);
+            });
+        }
+
+        cx.activate(true);
+    });
 }
