@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["host", "plugin"]
+
+# issen本体(../../../Cargo.toml)の[profile.release]と揃え、DLLサイズ比較を
+# フェアにするため。
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
