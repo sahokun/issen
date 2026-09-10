@@ -29,6 +29,14 @@ fn detect_system_lang() -> Lang {
     }
 }
 
+/// Whether Windows' own UI display language is Japanese, independent of
+/// this app's `Language` setting. Used by `config::Config::default` to
+/// decide whether Japanese-only default exclude patterns make sense on
+/// this machine.
+pub fn is_system_japanese() -> bool {
+    detect_system_lang() == Lang::Ja
+}
+
 // A handful of fields (e.g. an old button/placeholder label superseded by a
 // later UI redesign) aren't read by any window right now; kept rather than
 // deleted since removing a field means removing it from both language
@@ -127,6 +135,7 @@ pub struct Strings {
     pub tool_history: &'static str,
     pub history_empty: &'static str,
     pub tool_eyedropper: &'static str,
+    pub tool_copy_hex: &'static str,
     pub eyedropper_hint: &'static str,
     pub label_hex: &'static str,
     pub label_rgb: &'static str,
@@ -233,8 +242,8 @@ const EN: Strings = Strings {
     tool_history: "Search history",
     history_empty: "No search history yet",
     tool_eyedropper: "Eyedropper",
-    eyedropper_hint:
-        "Move the cursor over any pixel on screen, then press Enter to pick it (Esc to cancel)",
+    tool_copy_hex: "Copy hex code",
+    eyedropper_hint: "Move the cursor over any pixel on screen, then click or press Enter to pick it (Esc to cancel)",
     label_hex: "Hex",
     label_rgb: "RGB",
     label_hsl: "HSL",
@@ -340,7 +349,9 @@ const JA: Strings = Strings {
     tool_history: "検索履歴",
     history_empty: "検索履歴はまだありません",
     tool_eyedropper: "スポイト",
-    eyedropper_hint: "画面上の好きな場所にカーソルを合わせてEnterで確定(Escでキャンセル)",
+    tool_copy_hex: "カラーコードをコピー",
+    eyedropper_hint:
+        "画面上の好きな場所にカーソルを合わせてクリックまたはEnterで確定(Escでキャンセル)",
     label_hex: "Hex",
     label_rgb: "RGB",
     label_hsl: "HSL",

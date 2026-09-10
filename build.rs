@@ -2,10 +2,22 @@
 // `LoadLibraryW("Everything64.dll")` (src/search/everything.rs) can find it
 // via the exe's own directory, for both `cargo build`/`cargo run` and
 // `cargo build --release` (see docs/DEVELOPMENT.md's packaging section).
+//
+// Also embeds `assets/icon.ico` as the exe's Win32 icon resource (id 1) —
+// gpui_windows's `load_icon()` does `LoadImageW(module, PCWSTR(1), ...)`,
+// so this one resource covers both the Explorer/taskbar exe icon and every
+// gpui window's title-bar icon; `tray.rs` pulls the same resource via
+// `Icon::from_resource(1, ..)` for the tray icon.
 use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=third_party/Everything64.dll");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
+
+    winresource::WindowsResource::new()
+        .set_icon("assets/icon.ico")
+        .compile()
+        .expect("failed to embed assets/icon.ico as a Win32 resource");
 
     let src = PathBuf::from("third_party/Everything64.dll");
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

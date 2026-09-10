@@ -5,8 +5,9 @@
 //! window-lifecycle.md`), so every window paints its own.
 
 use gpui::{
-    div, hsla, px, rems, rgba, Div, Hsla, InteractiveElement, MouseButton, ParentElement,
-    SharedString, Styled, Window, WindowAppearance, WindowControlArea,
+    div, hsla, px, rems, rgba, AnyView, App, AppContext, Context, Div, Hsla, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, Styled, Window,
+    WindowAppearance, WindowControlArea,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
@@ -153,6 +154,47 @@ pub fn opaque_panel_bg(dark: bool) -> Hsla {
         rgba(0x12141AFFu32).into()
     } else {
         rgba(0xFAFAFCFFu32).into()
+    }
+}
+
+/// A small text tooltip styled to match the glass chrome, for icon-only
+/// buttons that have no visible label (e.g. the color picker's copy/
+/// eyedropper buttons in `tools/mod.rs`).
+struct SimpleTooltip {
+    text: SharedString,
+    dark: bool,
+}
+
+impl Render for SimpleTooltip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = palette(self.dark);
+        div()
+            .bg(opaque_panel_bg(self.dark))
+            .border_1()
+            .border_color(palette.border)
+            .rounded(px(6.))
+            .px(px(8.))
+            .py(px(4.))
+            .text_size(rems(11. / 16.))
+            .text_color(palette.text)
+            .child(self.text.clone())
+    }
+}
+
+/// Builds a `.tooltip()` callback showing `text` in the glass-chrome style.
+/// `dark` is snapshotted at call time (same as the rest of this window's
+/// palette) rather than re-resolved per hover.
+pub fn simple_tooltip(
+    text: impl Into<SharedString>,
+    dark: bool,
+) -> impl Fn(&mut Window, &mut App) -> AnyView {
+    let text = text.into();
+    move |_window, cx| {
+        cx.new(|_| SimpleTooltip {
+            text: text.clone(),
+            dark,
+        })
+        .into()
     }
 }
 
