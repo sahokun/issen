@@ -145,6 +145,10 @@ pub struct ToolsWindow {
     val: f32,
     hex_input: Entity<TextInput>,
     picking_color: bool,
+    /// Snapshot of `(hue, sat, val)` taken when the eyedropper starts, so
+    /// Escape can restore it — otherwise cancelling would leave whatever
+    /// pixel the cursor last happened to be over.
+    pre_pick_hsv: (f32, f32, f32),
     eyedropper_prev_confirm_key: bool,
     sv_dragging: bool,
     hue_dragging: bool,
@@ -207,6 +211,7 @@ impl ToolsWindow {
             val,
             hex_input,
             picking_color: false,
+            pre_pick_hsv: (hue, sat, val),
             eyedropper_prev_confirm_key: false,
             sv_dragging: false,
             hue_dragging: false,
@@ -318,7 +323,15 @@ impl ToolsWindow {
             return;
         }
         self.picking_color = true;
-        self.eyedropper_prev_confirm_key = false;
+        self.pre_pick_hsv = (self.hue, self.sat, self.val);
+        // Seed with the *current* confirm-key state rather than `false`: the
+        // mouse button that activated this eyedropper (a literal
+        // `on_mouse_down`) is still physically held at this exact instant,
+        // so treating it as "already down" stops the very first poll tick
+        // from reading that same press as a fresh confirm at the button's
+        // own location (see the same reasoning in `poll_eyedropper`'s doc
+        // comment for the Enter case).
+        self.eyedropper_prev_confirm_key = key_down(VK_RETURN) || key_down(VK_LBUTTON);
         cx.notify();
 
         cx.spawn(async move |this, cx| loop {
@@ -336,7 +349,7 @@ impl ToolsWindow {
     }
 
     /// One eyedropper poll tick: samples the pixel under the OS cursor and
-    /// checks Escape/Enter directly via Win32 (not GPUI input events), so
+    /// checks Escape/confirm directly via Win32 (not GPUI input events), so
     /// this tracks the cursor across the whole screen even though this
     /// window never has OS focus while picking. Returns whether the caller
     /// should keep polling. See the module doc comment for why this is a
@@ -347,6 +360,11 @@ impl ToolsWindow {
         }
         if key_down(VK_ESCAPE) {
             self.picking_color = false;
+            // Cancelling restores the color from before picking started,
+            // rather than leaving whatever pixel the cursor last happened
+            // to be over.
+            (self.hue, self.sat, self.val) = self.pre_pick_hsv;
+            self.sync_hex(cx);
             cx.notify();
             return false;
         }
@@ -364,11 +382,15 @@ impl ToolsWindow {
             }
         }
 
-        // Confirm on the rising edge (the moment Enter is pressed), not
-        // while held — otherwise the Enter/Space keypress that activated
-        // the eyedropper button itself would be picked up and confirm
-        // immediately.
-        let confirm_down = key_down(VK_RETURN);
+        // Confirm on the rising edge (the moment Enter or the left mouse
+        // button goes down), not while held — otherwise the press that
+        // activated the eyedropper button itself would be picked up and
+        // confirm immediately. A left click lets the color be locked right
+        // at the target pixel — anywhere on screen, on any monitor — after
+        // which the cursor is free to move back to this window (e.g. to
+        // press the copy-hex button) without changing the picked color
+        // further; Enter remains as a keyboard-only alternative.
+        let confirm_down = key_down(VK_RETURN) || key_down(VK_LBUTTON);
         if confirm_down && !self.eyedropper_prev_confirm_key {
             self.picking_color = false;
         }
@@ -784,6 +806,7 @@ impl Render for ToolsWindow {
 
 const VK_RETURN: i32 = 0x0D;
 const VK_ESCAPE: i32 = 0x1B;
+const VK_LBUTTON: i32 = 0x01;
 
 fn key_down(vk: i32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
