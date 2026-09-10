@@ -490,6 +490,8 @@ impl ToolsWindow {
     fn icon_button(
         key: &'static str,
         glyph: &'static str,
+        tooltip_text: &'static str,
+        dark: bool,
         palette: &GlassPalette,
         on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
@@ -504,11 +506,13 @@ impl ToolsWindow {
             .text_size(rems(14. / 16.))
             .hover(|d| d.bg(palette.control_bg))
             .on_mouse_down(MouseButton::Left, on_click)
+            .tooltip(ui_chrome::simple_tooltip(tooltip_text, dark))
             .child(glyph)
     }
 
     fn render_color_tab(
         &self,
+        dark: bool,
         palette: &GlassPalette,
         accent: Hsla,
         cx: &mut Context<Self>,
@@ -551,6 +555,8 @@ impl ToolsWindow {
                     .child(Self::icon_button(
                         "tool-copy-hex",
                         "\u{1F4CB}",
+                        strings.tool_copy_hex,
+                        dark,
                         palette,
                         move |_, _, _cx| {
                             crate::launch::copy_to_clipboard(&hex_for_copy);
@@ -559,6 +565,8 @@ impl ToolsWindow {
                     .child(Self::icon_button(
                         "tool-eyedropper",
                         "\u{1F4A7}",
+                        strings.tool_eyedropper,
+                        dark,
                         palette,
                         cx.listener(|this, _, _, cx| this.start_eyedropper(cx)),
                     )),
@@ -784,7 +792,7 @@ impl Render for ToolsWindow {
 
         let content = match self.kind {
             ToolKind::ColorPicker => self
-                .render_color_tab(&palette, accent, cx)
+                .render_color_tab(dark, &palette, accent, cx)
                 .into_any_element(),
             ToolKind::UnitConverter => self
                 .render_units_tab(&palette, accent, cx)

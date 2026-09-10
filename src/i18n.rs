@@ -127,6 +127,7 @@ pub struct Strings {
     pub tool_history: &'static str,
     pub history_empty: &'static str,
     pub tool_eyedropper: &'static str,
+    pub tool_copy_hex: &'static str,
     pub eyedropper_hint: &'static str,
     pub label_hex: &'static str,
     pub label_rgb: &'static str,
@@ -233,6 +234,7 @@ const EN: Strings = Strings {
     tool_history: "Search history",
     history_empty: "No search history yet",
     tool_eyedropper: "Eyedropper",
+    tool_copy_hex: "Copy hex code",
     eyedropper_hint: "Move the cursor over any pixel on screen, then click or press Enter to pick it (Esc to cancel)",
     label_hex: "Hex",
     label_rgb: "RGB",
@@ -339,6 +341,7 @@ const JA: Strings = Strings {
     tool_history: "検索履歴",
     history_empty: "検索履歴はまだありません",
     tool_eyedropper: "スポイト",
+    tool_copy_hex: "カラーコードをコピー",
     eyedropper_hint:
         "画面上の好きな場所にカーソルを合わせてクリックまたはEnterで確定(Escでキャンセル)",
     label_hex: "Hex",
