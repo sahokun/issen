@@ -145,6 +145,10 @@ pub struct ToolsWindow {
     val: f32,
     hex_input: Entity<TextInput>,
     picking_color: bool,
+    /// Snapshot of `(hue, sat, val)` taken when the eyedropper starts, so
+    /// Escape can restore it — otherwise cancelling would leave whatever
+    /// pixel the cursor last happened to be over.
+    pre_pick_hsv: (f32, f32, f32),
     eyedropper_prev_confirm_key: bool,
     sv_dragging: bool,
     hue_dragging: bool,
@@ -207,6 +211,7 @@ impl ToolsWindow {
             val,
             hex_input,
             picking_color: false,
+            pre_pick_hsv: (hue, sat, val),
             eyedropper_prev_confirm_key: false,
             sv_dragging: false,
             hue_dragging: false,
@@ -318,7 +323,15 @@ impl ToolsWindow {
             return;
         }
         self.picking_color = true;
-        self.eyedropper_prev_confirm_key = false;
+        self.pre_pick_hsv = (self.hue, self.sat, self.val);
+        // Seed with the *current* confirm-key state rather than `false`: the
+        // mouse button that activated this eyedropper (a literal
+        // `on_mouse_down`) is still physically held at this exact instant,
+        // so treating it as "already down" stops the very first poll tick
+        // from reading that same press as a fresh confirm at the button's
+        // own location (see the same reasoning in `poll_eyedropper`'s doc
+        // comment for the Enter case).
+        self.eyedropper_prev_confirm_key = key_down(VK_RETURN) || key_down(VK_LBUTTON);
         cx.notify();
 
         cx.spawn(async move |this, cx| loop {
@@ -336,7 +349,7 @@ impl ToolsWindow {
     }
 
     /// One eyedropper poll tick: samples the pixel under the OS cursor and
-    /// checks Escape/Enter directly via Win32 (not GPUI input events), so
+    /// checks Escape/confirm directly via Win32 (not GPUI input events), so
     /// this tracks the cursor across the whole screen even though this
     /// window never has OS focus while picking. Returns whether the caller
     /// should keep polling. See the module doc comment for why this is a
@@ -347,6 +360,11 @@ impl ToolsWindow {
         }
         if key_down(VK_ESCAPE) {
             self.picking_color = false;
+            // Cancelling restores the color from before picking started,
+            // rather than leaving whatever pixel the cursor last happened
+            // to be over.
+            (self.hue, self.sat, self.val) = self.pre_pick_hsv;
+            self.sync_hex(cx);
             cx.notify();
             return false;
         }
@@ -364,11 +382,15 @@ impl ToolsWindow {
             }
         }
 
-        // Confirm on the rising edge (the moment Enter is pressed), not
-        // while held — otherwise the Enter/Space keypress that activated
-        // the eyedropper button itself would be picked up and confirm
-        // immediately.
-        let confirm_down = key_down(VK_RETURN);
+        // Confirm on the rising edge (the moment Enter or the left mouse
+        // button goes down), not while held — otherwise the press that
+        // activated the eyedropper button itself would be picked up and
+        // confirm immediately. A left click lets the color be locked right
+        // at the target pixel — anywhere on screen, on any monitor — after
+        // which the cursor is free to move back to this window (e.g. to
+        // press the copy-hex button) without changing the picked color
+        // further; Enter remains as a keyboard-only alternative.
+        let confirm_down = key_down(VK_RETURN) || key_down(VK_LBUTTON);
         if confirm_down && !self.eyedropper_prev_confirm_key {
             self.picking_color = false;
         }
@@ -468,6 +490,8 @@ impl ToolsWindow {
     fn icon_button(
         key: &'static str,
         glyph: &'static str,
+        tooltip_text: &'static str,
+        dark: bool,
         palette: &GlassPalette,
         on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
@@ -482,11 +506,13 @@ impl ToolsWindow {
             .text_size(rems(14. / 16.))
             .hover(|d| d.bg(palette.control_bg))
             .on_mouse_down(MouseButton::Left, on_click)
+            .tooltip(ui_chrome::simple_tooltip(tooltip_text, dark))
             .child(glyph)
     }
 
     fn render_color_tab(
         &self,
+        dark: bool,
         palette: &GlassPalette,
         accent: Hsla,
         cx: &mut Context<Self>,
@@ -529,6 +555,8 @@ impl ToolsWindow {
                     .child(Self::icon_button(
                         "tool-copy-hex",
                         "\u{1F4CB}",
+                        strings.tool_copy_hex,
+                        dark,
                         palette,
                         move |_, _, _cx| {
                             crate::launch::copy_to_clipboard(&hex_for_copy);
@@ -537,6 +565,8 @@ impl ToolsWindow {
                     .child(Self::icon_button(
                         "tool-eyedropper",
                         "\u{1F4A7}",
+                        strings.tool_eyedropper,
+                        dark,
                         palette,
                         cx.listener(|this, _, _, cx| this.start_eyedropper(cx)),
                     )),
@@ -762,7 +792,7 @@ impl Render for ToolsWindow {
 
         let content = match self.kind {
             ToolKind::ColorPicker => self
-                .render_color_tab(&palette, accent, cx)
+                .render_color_tab(dark, &palette, accent, cx)
                 .into_any_element(),
             ToolKind::UnitConverter => self
                 .render_units_tab(&palette, accent, cx)
@@ -784,24 +814,53 @@ impl Render for ToolsWindow {
 
 const VK_RETURN: i32 = 0x0D;
 const VK_ESCAPE: i32 = 0x1B;
+const VK_LBUTTON: i32 = 0x01;
 
 fn key_down(vk: i32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
     unsafe { (GetAsyncKeyState(vk) as u16) & 0x8000 != 0 }
 }
 
-/// Reads the pixel color at the given screen coordinates from the
-/// whole-desktop device context. `GetDC(None)` returns the whole-desktop
-/// DC when hWnd is NULL (per MSDN). Returns `None` on failure.
+/// Reads the pixel color at the given screen coordinates.
+///
+/// Goes through a 1x1 `BitBlt` into a memory DC rather than calling
+/// `GetPixel` directly on the `GetDC(None)` whole-desktop DC: the direct
+/// approach reliably reads only the primary monitor — on a secondary
+/// monitor `GetPixel` returns `CLR_INVALID` or a stale/wrong color on many
+/// driver stacks, a long-documented GDI limitation. `BitBlt` composites
+/// through the desktop the same way screenshot tools do, so it reads every
+/// monitor correctly regardless of arrangement or per-monitor DPI.
 fn screen_pixel_color(x: i32, y: i32) -> Option<(u8, u8, u8)> {
-    use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetPixel, ReleaseDC, SelectObject, SRCCOPY,
+    };
     unsafe {
-        let hdc = GetDC(None);
-        if hdc.is_invalid() {
+        let screen_dc = GetDC(None);
+        if screen_dc.is_invalid() {
             return None;
         }
-        let color = GetPixel(hdc, x, y);
-        ReleaseDC(None, hdc);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        if mem_dc.is_invalid() {
+            ReleaseDC(None, screen_dc);
+            return None;
+        }
+        let bitmap = CreateCompatibleBitmap(screen_dc, 1, 1);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(None, screen_dc);
+            return None;
+        }
+
+        let prev_bitmap = SelectObject(mem_dc, bitmap.into());
+        let blt_ok = BitBlt(mem_dc, 0, 0, 1, 1, Some(screen_dc), x, y, SRCCOPY).is_ok();
+        let color = blt_ok.then(|| GetPixel(mem_dc, 0, 0));
+        SelectObject(mem_dc, prev_bitmap);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(None, screen_dc);
+
+        let color = color?;
         // CLR_INVALID: the coordinates were invalid, or reading the pixel failed.
         if color.0 == 0xFFFF_FFFF {
             return None;
