@@ -136,7 +136,7 @@ impl TrayHandle {
         let _ = menu.append(&quit_item);
 
         let tray_icon = TrayIconBuilder::new()
-            .with_icon(placeholder_icon()?)
+            .with_icon(app_icon()?)
             .with_tooltip("Issen")
             .with_menu(Box::new(menu))
             // Left-click-opens-menu is `tray-icon`'s default (`true`); leaving it
@@ -210,13 +210,9 @@ impl TrayHandle {
     }
 }
 
-/// Placeholder icon: a solid 32x32 square in the accent color (#F2A93B).
-/// Swap for a proper icon resource eventually.
-fn placeholder_icon() -> Option<Icon> {
-    const SIZE: u32 = 32;
-    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    for _ in 0..(SIZE * SIZE) {
-        rgba.extend_from_slice(&[0xF2, 0xA9, 0x3B, 0xFF]);
-    }
-    Icon::from_rgba(rgba, SIZE, SIZE).ok()
+/// Loads Issen's app icon from the exe's own embedded Win32 resource
+/// (id 1 — see `build.rs`, which embeds `assets/icon.ico` there via
+/// `winresource`) rather than decoding a bundled image file at runtime.
+fn app_icon() -> Option<Icon> {
+    Icon::from_resource(1, Some((32, 32))).ok()
 }
