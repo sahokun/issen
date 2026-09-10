@@ -29,6 +29,14 @@ fn detect_system_lang() -> Lang {
     }
 }
 
+/// Whether Windows' own UI display language is Japanese, independent of
+/// this app's `Language` setting. Used by `config::Config::default` to
+/// decide whether Japanese-only default exclude patterns make sense on
+/// this machine.
+pub fn is_system_japanese() -> bool {
+    detect_system_lang() == Lang::Ja
+}
+
 // A handful of fields (e.g. an old button/placeholder label superseded by a
 // later UI redesign) aren't read by any window right now; kept rather than
 // deleted since removing a field means removing it from both language

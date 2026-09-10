@@ -36,6 +36,22 @@ pub struct Config {
     pub ui_font: UiFont,
 }
 
+/// The default `exclude_patterns` entry: filters out uninstaller/setup
+/// shortcuts that Windows installers commonly drop into the Start Menu
+/// alongside the app itself. "Uninstall" covers the common English label
+/// regardless of system language; the Japanese equivalents ("アンイン
+/// ストール", "初期設定") are added only when Windows' own UI language is
+/// Japanese, so an English-Windows user doesn't get a pattern full of
+/// characters they can't read (and, if their font setup can't render CJK
+/// at all, might not even be able to identify or remove from the list).
+fn default_exclude_pattern() -> String {
+    if crate::i18n::is_system_japanese() {
+        "(?i)^(Uninstall|アンインストール|初期設定)".to_string()
+    } else {
+        "(?i)^Uninstall".to_string()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AliasEntry {
     pub name: String,
@@ -62,7 +78,7 @@ impl Default for Config {
             display_target: DisplayTarget::Cursor,
             everything_enabled: false,
             index_folders: Vec::new(),
-            exclude_patterns: vec!["(?i)^(Uninstall|アンインストール)".to_string()],
+            exclude_patterns: vec![default_exclude_pattern()],
             aliases: Vec::new(),
             custom_windows_shortcuts: Vec::new(),
             ui_font: UiFont::SegoeUi,
