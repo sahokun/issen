@@ -790,18 +790,46 @@ fn key_down(vk: i32) -> bool {
     unsafe { (GetAsyncKeyState(vk) as u16) & 0x8000 != 0 }
 }
 
-/// Reads the pixel color at the given screen coordinates from the
-/// whole-desktop device context. `GetDC(None)` returns the whole-desktop
-/// DC when hWnd is NULL (per MSDN). Returns `None` on failure.
+/// Reads the pixel color at the given screen coordinates.
+///
+/// Goes through a 1x1 `BitBlt` into a memory DC rather than calling
+/// `GetPixel` directly on the `GetDC(None)` whole-desktop DC: the direct
+/// approach reliably reads only the primary monitor — on a secondary
+/// monitor `GetPixel` returns `CLR_INVALID` or a stale/wrong color on many
+/// driver stacks, a long-documented GDI limitation. `BitBlt` composites
+/// through the desktop the same way screenshot tools do, so it reads every
+/// monitor correctly regardless of arrangement or per-monitor DPI.
 fn screen_pixel_color(x: i32, y: i32) -> Option<(u8, u8, u8)> {
-    use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetPixel, ReleaseDC, SelectObject, SRCCOPY,
+    };
     unsafe {
-        let hdc = GetDC(None);
-        if hdc.is_invalid() {
+        let screen_dc = GetDC(None);
+        if screen_dc.is_invalid() {
             return None;
         }
-        let color = GetPixel(hdc, x, y);
-        ReleaseDC(None, hdc);
+        let mem_dc = CreateCompatibleDC(Some(screen_dc));
+        if mem_dc.is_invalid() {
+            ReleaseDC(None, screen_dc);
+            return None;
+        }
+        let bitmap = CreateCompatibleBitmap(screen_dc, 1, 1);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(None, screen_dc);
+            return None;
+        }
+
+        let prev_bitmap = SelectObject(mem_dc, bitmap.into());
+        let blt_ok = BitBlt(mem_dc, 0, 0, 1, 1, Some(screen_dc), x, y, SRCCOPY).is_ok();
+        let color = blt_ok.then(|| GetPixel(mem_dc, 0, 0));
+        SelectObject(mem_dc, prev_bitmap);
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(None, screen_dc);
+
+        let color = color?;
         // CLR_INVALID: the coordinates were invalid, or reading the pixel failed.
         if color.0 == 0xFFFF_FFFF {
             return None;
