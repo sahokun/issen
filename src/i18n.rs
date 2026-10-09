@@ -76,6 +76,10 @@ pub struct Strings {
 
     pub label_autostart: &'static str,
     pub label_hotkey: &'static str,
+    pub hotkey_recording: &'static str,
+    pub hotkey_hint: &'static str,
+    pub hotkey_change: &'static str,
+    pub hotkey_cancel: &'static str,
     pub label_language: &'static str,
     pub language_system: &'static str,
     pub language_en: &'static str,
@@ -183,6 +187,10 @@ const EN: Strings = Strings {
 
     label_autostart: "Launch Issen when Windows starts",
     label_hotkey: "Global hotkey",
+    hotkey_recording: "Press a shortcut…",
+    hotkey_hint: "Choose Change, then press a shortcut. Esc cancels.",
+    hotkey_change: "Change",
+    hotkey_cancel: "Cancel",
     label_language: "Display language",
     language_system: "Match Windows",
     language_en: "English",
@@ -290,6 +298,10 @@ const JA: Strings = Strings {
 
     label_autostart: "Windowsスタートアップ時に自動起動する",
     label_hotkey: "グローバルホットキー",
+    hotkey_recording: "ショートカットキーを押してください…",
+    hotkey_hint: "「変更」を押してキーを入力します。Escでキャンセル。",
+    hotkey_change: "変更",
+    hotkey_cancel: "キャンセル",
     label_language: "表示言語",
     language_system: "システムに合わせる",
     language_en: "English",
