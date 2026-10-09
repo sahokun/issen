@@ -104,3 +104,20 @@ Built around a `SearchProvider` trait, with these built-in providers:
 - The color picker and unit converter are implemented as separate
   top-level windows rather than as `SearchProvider` results — see
   `docs/architecture/tools.md`.
+
+## Suggestion icons
+
+`src/icons.rs` derives icons from result actions without extending the plugin
+ABI. File, executable, shortcut, and folder results use Windows Shell icons;
+packaged apps use `shell:AppsFolder\<AUMID>`. `IShellItemImageFactory::GetImage`
+with `SIIGBF_ICONONLY` runs on a background executor, never on the UI thread
+([Windows API guidance](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ishellitemimagefactory-getimage)).
+COM initialization and GDI bitmap/DC cleanup are confined to that worker.
+The 32px BGRA bitmap renders at 20 logical pixels in a fixed-width result slot.
+
+An in-memory FIFO cache holds up to 256 targets, including failed lookups;
+one batch is in flight at a time. Completion notifies the view and requests
+any icons missing from the latest results, so stale search batches cannot
+replace current results or accumulate unbounded jobs. Segoe MDL2 glyphs fill
+the slot while loading or on failure, and identify Settings/URI/clipboard
+actions without shell extraction. Pin markers remain independent.

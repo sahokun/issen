@@ -2762,6 +2762,7 @@ dependencies = [
  "futures",
  "gpui",
  "gpui_platform",
+ "image",
  "issen-plugin-api",
  "raw-window-handle",
  "regex",
