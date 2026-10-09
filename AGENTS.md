@@ -1,10 +1,5 @@
 # AGENTS.md
 
-Instructions for AI coding agents working on **Issen**. This file only
-points into the project's own documentation — it doesn't duplicate content,
-and no project file depends on this one. If something below is out of
-date, fix the referenced doc rather than this file.
-
 - Project overview & features: [`README.md`](README.md)
 - Tech stack, build/lint/test commands, project layout, git workflow:
   [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)
@@ -24,4 +19,3 @@ date, fix the referenced doc rather than this file.
   | i18n (language switching, CJK font fallback)  | `docs/architecture/i18n.md`                     |
 
 - Day-to-day change history: `git log` and [`CHANGELOG.md`](CHANGELOG.md)
-  — this file intentionally doesn't repeat it.

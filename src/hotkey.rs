@@ -14,7 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const HOTKEY_ID: i32 = 1;
 const VK_SPACE: u32 = 0x20;
-/// Cross-thread message used for live hotkey updates (the new string is
+/// Cross-thread message used for live hotkey updates (the command is
 /// pushed onto `update_tx`'s channel first, and this unblocks `GetMessageW`
 /// so the listener thread goes and picks it up).
 const WM_UPDATE_HOTKEY: u32 = WM_APP + 1;
@@ -26,7 +26,12 @@ pub struct HotkeyListener {
     /// realistically called before that happens, but `0` is treated as
     /// "not yet received" and ignored just in case.
     thread_id: u32,
-    update_tx: Sender<String>,
+    update_tx: Sender<HotkeyCommand>,
+}
+
+enum HotkeyCommand {
+    Set(String),
+    Suspend(bool),
 }
 
 impl HotkeyListener {
@@ -39,15 +44,12 @@ impl HotkeyListener {
     ///
     /// `hotkey_spec` is `config.hotkey` (e.g. `"Alt+Space"`). If it fails
     /// to parse, this falls back to the default `Alt+Space` — but only for
-    /// this initial registration. A live update via `update_hotkey` that
-    /// fails to parse instead just keeps the current registration as-is,
-    /// because the settings window's hotkey field applies on every
-    /// keystroke; if invalid partial input like `"C"` → `"Ct"` → `"Ctrl+"`
-    /// fell back to Alt+Space each time, the live global hotkey would keep
-    /// changing out from under the user while they're still typing.
+    /// this initial registration. Live updates that fail to parse keep the
+    /// current registration. The settings recorder suspends registration
+    /// while capturing, then resumes it on commit, cancellation, or blur.
     pub fn spawn(hotkey_spec: String) -> (Self, UnboundedReceiver<()>) {
         let (toggle_tx, toggle_rx) = unbounded();
-        let (update_tx, update_rx) = channel::<String>();
+        let (update_tx, update_rx) = channel::<HotkeyCommand>();
         let (thread_id_tx, thread_id_rx) = channel();
 
         thread::spawn(move || unsafe {
@@ -72,6 +74,8 @@ impl HotkeyListener {
             if !registered {
                 eprintln!("issen: failed to register hotkey {hotkey_spec:?}");
             }
+            let mut current = (modifiers, vk);
+            let mut suspended = false;
 
             loop {
                 let mut msg = MSG::default();
@@ -83,23 +87,26 @@ impl HotkeyListener {
                         let _ = toggle_tx.unbounded_send(());
                     }
                     WM_UPDATE_HOTKEY => {
-                        let Ok(new_spec) = update_rx.try_recv() else {
+                        let Ok(command) = update_rx.try_recv() else {
                             continue;
                         };
-                        // Only re-register if it actually parses (see the doc comment
-                        // above); otherwise leave the current registration as-is.
-                        if let Some((modifiers, vk)) = parse_hotkey(&new_spec) {
-                            if registered {
-                                let _ = UnregisterHotKey(None, HOTKEY_ID);
+                        match command {
+                            HotkeyCommand::Set(spec) => {
+                                let Some(parsed) = parse_hotkey(&spec) else {
+                                    continue;
+                                };
+                                current = parsed;
                             }
-                            registered =
-                                RegisterHotKey(None, HOTKEY_ID, modifiers | MOD_NOREPEAT, vk)
-                                    .is_ok();
-                            if !registered {
-                                eprintln!(
-                                    "issen: failed to re-register hotkey {new_spec:?}; hotkey is now unregistered until a valid one is set"
-                                );
-                            }
+                            HotkeyCommand::Suspend(value) => suspended = value,
+                        }
+                        if registered {
+                            let _ = UnregisterHotKey(None, HOTKEY_ID);
+                        }
+                        registered = !suspended
+                            && RegisterHotKey(None, HOTKEY_ID, current.0 | MOD_NOREPEAT, current.1)
+                                .is_ok();
+                        if !suspended && !registered {
+                            eprintln!("issen: failed to register hotkey");
                         }
                     }
                     _ => {}
@@ -117,13 +124,22 @@ impl HotkeyListener {
 
     /// Re-registers the hotkey while running (reflects a settings-window
     /// change immediately). If `new_spec` doesn't currently parse (e.g. a
-    /// partial in-progress string), this doesn't error — the listener
+    /// unsupported key specification), this doesn't error — the listener
     /// thread checks it and ignores it (see `spawn`'s doc comment).
     pub fn update_hotkey(&self, new_spec: String) {
+        self.send(HotkeyCommand::Set(new_spec));
+    }
+
+    /// Let the settings recorder receive even the currently registered chord.
+    pub fn suspend(&self, suspended: bool) {
+        self.send(HotkeyCommand::Suspend(suspended));
+    }
+
+    fn send(&self, command: HotkeyCommand) {
         if self.thread_id == 0 {
             return;
         }
-        if self.update_tx.send(new_spec).is_err() {
+        if self.update_tx.send(command).is_err() {
             return;
         }
         unsafe {
@@ -134,6 +150,46 @@ impl HotkeyListener {
             }
         }
     }
+}
+
+/// Canonical config syntax from a physical key chord, never from typed text.
+/// Ignore modifiers alone and keys our Win32 registration cannot represent.
+pub fn recorded_hotkey(key: &gpui::Keystroke) -> Option<String> {
+    let vk = parse_key(&key.key)?;
+    let base = match vk {
+        0x20 => "Space".into(),
+        0x09 => "Tab".into(),
+        0x0D => "Enter".into(),
+        0x1B => "Escape".into(),
+        0x08 => "Backspace".into(),
+        0x21 => "PageUp".into(),
+        0x22 => "PageDown".into(),
+        0x23 => "End".into(),
+        0x24 => "Home".into(),
+        0x25 => "Left".into(),
+        0x26 => "Up".into(),
+        0x27 => "Right".into(),
+        0x28 => "Down".into(),
+        0x2D => "Insert".into(),
+        0x2E => "Delete".into(),
+        0x70..=0x87 => format!("F{}", vk - 0x70 + 1),
+        _ => char::from_u32(vk)?.to_string(),
+    };
+    let mut parts = Vec::new();
+    if key.modifiers.control {
+        parts.push("Ctrl");
+    }
+    if key.modifiers.alt {
+        parts.push("Alt");
+    }
+    if key.modifiers.shift {
+        parts.push("Shift");
+    }
+    if key.modifiers.platform {
+        parts.push("Win");
+    }
+    parts.push(&base);
+    Some(parts.join("+"))
 }
 
 /// Parses a string like `"Ctrl+Shift+K"`. Modifier keys (Ctrl/Alt/Shift/Win)
@@ -175,6 +231,16 @@ fn parse_key(key: &str) -> Option<u32> {
         "enter" | "return" => return Some(0x0D),
         "escape" | "esc" => return Some(0x1B),
         "backspace" => return Some(0x08),
+        "pageup" => return Some(0x21),
+        "pagedown" => return Some(0x22),
+        "end" => return Some(0x23),
+        "home" => return Some(0x24),
+        "left" => return Some(0x25),
+        "up" => return Some(0x26),
+        "right" => return Some(0x27),
+        "down" => return Some(0x28),
+        "insert" => return Some(0x2D),
+        "delete" => return Some(0x2E),
         _ => {}
     }
 
@@ -193,6 +259,58 @@ fn parse_key(key: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_chords_roundtrip_to_win32_keys() {
+        for (key, name, vk) in [
+            ("space", "Space", 0x20),
+            ("k", "K", 0x4B),
+            ("f12", "F12", 0x7B),
+            ("left", "Left", 0x25),
+            ("delete", "Delete", 0x2E),
+        ] {
+            let stroke = gpui::Keystroke {
+                modifiers: gpui::Modifiers {
+                    control: true,
+                    shift: true,
+                    ..Default::default()
+                },
+                key: key.into(),
+                key_char: None,
+            };
+            let spec = recorded_hotkey(&stroke).unwrap();
+            assert_eq!(spec, format!("Ctrl+Shift+{name}"));
+            assert_eq!(parse_hotkey(&spec), Some((MOD_CONTROL | MOD_SHIFT, vk)));
+        }
+    }
+
+    #[test]
+    fn capture_ignores_modifiers_and_unsupported_keys() {
+        for key in ["control", "alt", "shift", "platform", "+", "あ"] {
+            assert!(recorded_hotkey(&gpui::Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: key.into(),
+                key_char: None,
+            })
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn capture_preserves_alt_and_windows_modifiers() {
+        let spec = recorded_hotkey(&gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                alt: true,
+                platform: true,
+                ..Default::default()
+            },
+            key: "enter".into(),
+            key_char: None,
+        })
+        .unwrap();
+        assert_eq!(spec, "Alt+Win+Enter");
+        assert_eq!(parse_hotkey(&spec), Some((MOD_ALT | MOD_WIN, 0x0D)));
+    }
 
     #[test]
     fn parses_default_hotkey() {
