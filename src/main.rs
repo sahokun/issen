@@ -14,6 +14,7 @@ mod fonts;
 mod history;
 mod hotkey;
 mod i18n;
+mod icons;
 mod launch;
 mod search;
 mod settings_window;

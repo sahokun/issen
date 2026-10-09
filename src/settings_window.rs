@@ -18,9 +18,10 @@
 use std::time::Instant;
 
 use gpui::{
-    div, point, prelude::*, px, rems, size, App, AppContext, Bounds, Context, Div, Entity, Hsla,
-    InteractiveElement, MouseButton, ParentElement, ScrollHandle, SharedString, Styled, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    div, point, prelude::*, px, rems, size, App, AppContext, Bounds, Context, Div, Entity,
+    FocusHandle, Hsla, InteractiveElement, KeyDownEvent, MouseButton, ParentElement, ScrollHandle,
+    SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions,
 };
 
 use crate::app::{IssenApp, MAX_VISIBLE_ROWS};
@@ -77,7 +78,8 @@ pub struct SettingsWindow {
 
     cached: AppSnapshot,
 
-    hotkey_input: Entity<TextInput>,
+    hotkey_focus: FocusHandle,
+    recording_hotkey: bool,
     new_exclude_pattern_input: Entity<TextInput>,
     new_alias_name_input: Entity<TextInput>,
     new_alias_target_input: Entity<TextInput>,
@@ -140,7 +142,7 @@ pub fn open(
             },
             move |window, cx| {
                 ui_chrome::set_topmost(window);
-                cx.new(|cx| SettingsWindow::new(app, initial, cx))
+                cx.new(|cx| SettingsWindow::new(app, initial, window, cx))
             },
         )
         .expect("failed to open settings window");
@@ -157,20 +159,29 @@ fn set_config(app: &WeakEntity<IssenApp>, cx: &mut App, f: impl FnOnce(&mut Conf
 }
 
 impl SettingsWindow {
-    fn new(app: WeakEntity<IssenApp>, initial: AppSnapshot, cx: &mut Context<Self>) -> Self {
+    fn new(
+        app: WeakEntity<IssenApp>,
+        initial: AppSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let everything_available = crate::search::everything::is_available();
 
-        let hotkey_input = cx.new(|cx| TextInput::new(cx, initial.config.hotkey.clone(), ""));
-        cx.observe(&hotkey_input, {
-            let app = app.clone();
-            move |_, entity, cx| {
-                let text = entity.read(cx).text().to_string();
-                if let Some(app_entity) = app.upgrade() {
-                    app_entity.update(cx, |app, cx| {
-                        app.config.hotkey = text.clone();
-                        app.hotkey.update_hotkey(text);
-                        cx.notify();
-                    });
+        let hotkey_focus = cx.focus_handle();
+        cx.on_blur(&hotkey_focus, window, |this, _, cx| {
+            this.end_hotkey_recording(cx)
+        })
+        .detach();
+        cx.observe_window_activation(window, |this, window, cx| {
+            if !window.is_window_active() {
+                this.end_hotkey_recording(cx);
+            }
+        })
+        .detach();
+        cx.on_release(|this, cx| {
+            if this.recording_hotkey {
+                if let Some(app) = this.app.upgrade() {
+                    app.read(cx).hotkey.suspend(false);
                 }
             }
         })
@@ -201,9 +212,7 @@ impl SettingsWindow {
         // reading an entity during render implicitly subscribe to it)
         // doesn't apply to it — without an explicit observe per field, a
         // keystroke would update the entity's state but never trigger this
-        // window to repaint it. `hotkey_input` gets this for free as a
-        // side effect of the write-back observe above (it re-notifies via
-        // the app entity); every other field needs its own plain forward.
+        // window to repaint it. Each field forwards its notifications here.
         let new_exclude_pattern_input = cx.new(|cx| TextInput::new(cx, "", ""));
         let new_alias_name_input = cx.new(|cx| TextInput::new(cx, "", ""));
         let new_alias_target_input = cx.new(|cx| TextInput::new(cx, "", ""));
@@ -228,13 +237,50 @@ impl SettingsWindow {
             content_scroll: ScrollHandle::new(),
             pending_folder_pick: false,
             cached: initial,
-            hotkey_input,
+            hotkey_focus,
+            recording_hotkey: false,
             new_exclude_pattern_input,
             new_alias_name_input,
             new_alias_target_input,
             new_alias_args_input,
             new_shortcut_label_input,
             new_shortcut_uri_input,
+        }
+    }
+
+    fn end_hotkey_recording(&mut self, cx: &mut Context<Self>) {
+        if self.recording_hotkey {
+            self.recording_hotkey = false;
+            if let Some(app) = self.app.upgrade() {
+                app.read(cx).hotkey.suspend(false);
+            }
+            cx.notify();
+        }
+    }
+
+    fn record_hotkey(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.recording_hotkey {
+            return;
+        }
+        cx.stop_propagation();
+        if event.is_held {
+            return;
+        }
+        if event.keystroke.key == "escape"
+            && event.keystroke.modifiers == gpui::Modifiers::default()
+        {
+            self.end_hotkey_recording(cx);
+            return;
+        }
+        if let Some(spec) = crate::hotkey::recorded_hotkey(&event.keystroke) {
+            if let Some(app) = self.app.upgrade() {
+                app.update(cx, |app, cx| {
+                    app.config.hotkey = spec.clone();
+                    app.hotkey.update_hotkey(spec);
+                    cx.notify();
+                });
+            }
+            self.end_hotkey_recording(cx);
         }
     }
 
@@ -618,14 +664,87 @@ impl SettingsWindow {
                     .flex_col()
                     .gap_1()
                     .child(Self::row_label(strings.label_hotkey, palette))
-                    .child(text_input::text_field(
-                        &self.hotkey_input,
-                        palette.text,
-                        accent,
-                        palette.control_bg,
-                        palette.control_border,
-                        cx,
-                    )),
+                    .child(
+                        div()
+                            .id("hotkey-recorder")
+                            .track_focus(&self.hotkey_focus)
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .on_mouse_down_out(
+                                cx.listener(|this, _, _, cx| this.end_hotkey_recording(cx)),
+                            )
+                            .on_key_down(cx.listener(Self::record_hotkey))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(32.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .overflow_hidden()
+                                    .bg(palette.control_bg)
+                                    .text_color(palette.text)
+                                    .text_size(rems(13. / 16.))
+                                    .border_1()
+                                    .border_color(if self.recording_hotkey {
+                                        accent
+                                    } else {
+                                        palette.control_border
+                                    })
+                                    .rounded(px(6.))
+                                    .child(if self.recording_hotkey {
+                                        strings.hotkey_recording.to_string()
+                                    } else {
+                                        config.hotkey.clone()
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .id("hotkey-change")
+                                    .flex_none()
+                                    .h(px(32.))
+                                    .px(px(14.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(palette.control_bg)
+                                    .text_color(palette.text)
+                                    .text_size(rems(13. / 16.))
+                                    .border_1()
+                                    .border_color(palette.control_border)
+                                    .rounded(px(6.))
+                                    .cursor_pointer()
+                                    .hover(|style| style.border_color(accent).text_color(accent))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, cx| {
+                                            if this.recording_hotkey {
+                                                this.end_hotkey_recording(cx);
+                                            } else {
+                                                this.recording_hotkey = true;
+                                                if let Some(app) = this.app.upgrade() {
+                                                    app.read(cx).hotkey.suspend(true);
+                                                }
+                                                this.hotkey_focus.focus(window, cx);
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )
+                                    .child(if self.recording_hotkey {
+                                        strings.hotkey_cancel
+                                    } else {
+                                        strings.hotkey_change
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(rems(11. / 16.))
+                            .text_color(palette.subtext)
+                            .child(strings.hotkey_hint),
+                    ),
             )
             .child(Self::stepper_row(
                 strings.label_max_results,

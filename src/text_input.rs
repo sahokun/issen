@@ -1,5 +1,5 @@
 //! A reusable single-line text input entity, for the settings window's text
-//! fields (hotkey, exclude-pattern, alias name/target/args, shortcut
+//! fields (exclude-pattern, alias name/target/args, shortcut
 //! label/uri). Adapted from `app.rs`'s `IssenApp`/`TextElement` pair (the
 //! search box's own IME-aware input handling), but decoupled from
 //! `IssenApp` so multiple independent instances can exist in one window.

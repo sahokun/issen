@@ -2755,13 +2755,14 @@ dependencies = [
 
 [[package]]
 name = "issen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "abi_stable",
  "arboard",
  "futures",
  "gpui",
  "gpui_platform",
+ "image",
  "issen-plugin-api",
  "raw-window-handle",
  "regex",

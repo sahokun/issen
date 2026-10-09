@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    actions, anchored, deferred, div, fill, hsla, point, prelude::*, px, rems, size, white,
+    actions, anchored, deferred, div, fill, hsla, img, point, prelude::*, px, rems, size, white,
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, CursorStyle, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, Focusable, GlobalElementId,
     KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
@@ -152,6 +152,7 @@ pub struct IssenApp {
     is_selecting: bool,
 
     results: Vec<SearchResult>,
+    icons: Entity<crate::icons::IconCache>,
     selected: usize,
     /// The window's current content height, guarding `Window::resize` so it's
     /// only called when the value actually changes (same pattern as the
@@ -244,6 +245,9 @@ impl IssenApp {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
 
+        let icons = cx.new(|_| crate::icons::IconCache::default());
+        cx.observe(&icons, |_, _, cx| cx.notify()).detach();
+
         let mut app = Self {
             lang,
             strings,
@@ -256,6 +260,7 @@ impl IssenApp {
             last_bounds: None,
             is_selecting: false,
             results: Vec::new(),
+            icons,
             selected: 0,
             content_height: MAIN_WINDOW_SIZE.1,
             visible: false,
@@ -1758,6 +1763,13 @@ impl Render for IssenApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         ui_chrome::apply_font_scale(window, self.config.font_scale);
         self.sync_window_height(window);
+        let sources = self
+            .results
+            .iter()
+            .filter_map(|result| crate::icons::IconSource::for_action(&result.action))
+            .collect();
+        self.icons
+            .update(cx, |icons, cx| icons.request(sources, cx));
 
         let accent = ui_chrome::accent_color(self.config.accent_color);
         // 実機確認の結果、0.80が好みの透け具合として指定された。
@@ -1914,6 +1926,18 @@ impl Render for IssenApp {
                 // into the fixed-height scroll wrapper below, not capped
                 // here.
                 .map(|(i, result)| {
+                    let icon = crate::icons::IconSource::for_action(&result.action)
+                        .and_then(|source| self.icons.read(cx).get(&source));
+                    let icon = if let Some(icon) = icon {
+                        img(icon).size(px(20.)).into_any_element()
+                    } else {
+                        div()
+                            .font_family("Segoe MDL2 Assets")
+                            .text_size(px(18.))
+                            .text_color(hsla(0., 0., 1., 0.75))
+                            .child(crate::icons::fallback(&result.action))
+                            .into_any_element()
+                    };
                     let is_selected = i == self.selected;
                     let is_pinned = result.score >= crate::history::HISTORY_SCORE_BOOST;
                     let hint = if i == 0 {
@@ -1950,6 +1974,15 @@ impl Render for IssenApp {
                                 });
                                 cx.notify();
                             }),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(24.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon),
                         )
                         .child(if is_pinned {
                             div()

@@ -7,9 +7,8 @@ Covers: `src/hotkey.rs`, `src/app.rs`.
   - `HotkeyListener` (`src/hotkey.rs`) owns a single background thread with
     its own message loop, which calls `RegisterHotKey(None, ...)` —
     registration is tied to the calling thread's message queue. Changing
-    the hotkey at runtime (`app.rs`'s hotkey field's `cx.observe`
-    handler, `settings_window.rs`) posts a custom message to that same
-    thread via `PostThreadMessageW`, which then does `UnregisterHotKey` →
+    the hotkey at runtime (`settings_window.rs`'s recorder) posts a custom
+    message to that same thread via `PostThreadMessageW`, which then does `UnregisterHotKey` →
     `RegisterHotKey` itself, because `RegisterHotKey(None, ...)` can only
     be unregistered/re-registered from the thread that registered it.
   - `HotkeyListener::spawn` returns a `futures::channel::mpsc::
@@ -21,12 +20,17 @@ Covers: `src/hotkey.rs`, `src/app.rs`.
     on each wakeup (see `docs/architecture/window-lifecycle.md`'s
     "Event-driven wake-up" section — the same pattern used for tray
     events).
-  - The settings window's hotkey field applies on every keystroke (e.g.
-    `"C"` → `"Ct"` → `"Ctrl+"` as the user types). Falling back to
-    `Alt+Space` whenever parsing fails would make the live hotkey flicker
-    mid-typing, so the fallback to a default only applies at startup's
-    initial registration; live updates simply keep the current
-    registration whenever the new string doesn't parse yet.
+  - Settings display the current chord beside a **Change** button. Clicking it
+    focuses a key recorder (not a text input), temporarily unregisters the
+    global hotkey so even the current chord can be captured, and records the
+    next supported non-modifier key with its Ctrl/Alt/Shift/Win modifiers.
+    Modifier-only presses and held-key repeats do not commit. Escape, Cancel,
+    clicking elsewhere, focus loss, or closing the settings window cancels
+    recording and restores registration. A complete chord takes effect
+    immediately; the existing Save button persists it to config.toml.
+    The listener's Set/Suspend commands are serialized on its owning thread.
+    Invalid live specifications preserve the current registration; startup
+    alone falls back to Alt+Space for invalid configuration.
 - Incremental search uses fuzzy matching.
 - `Alt+2`–`Alt+9` jump straight to a visible result by position
   (`AltNum2`..`AltNum9` `KeyBinding`s, `IssenApp::run`). The range is
