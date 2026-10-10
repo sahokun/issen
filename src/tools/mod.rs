@@ -30,6 +30,7 @@
 //!     `background_executor().timer(...)`, ticking roughly 60 times/sec
 //!     until Escape/Enter or the window closes.
 pub mod color;
+mod eyedropper;
 pub mod units;
 
 use std::time::Duration;
@@ -150,6 +151,7 @@ pub struct ToolsWindow {
     /// pixel the cursor last happened to be over.
     pre_pick_hsv: (f32, f32, f32),
     eyedropper_prev_confirm_key: bool,
+    screen_click: Option<eyedropper::ScreenClick>,
     sv_dragging: bool,
     hue_dragging: bool,
     /// Window-space bounds of the SV square / hue bar's drag surface,
@@ -213,6 +215,7 @@ impl ToolsWindow {
             picking_color: false,
             pre_pick_hsv: (hue, sat, val),
             eyedropper_prev_confirm_key: false,
+            screen_click: None,
             sv_dragging: false,
             hue_dragging: false,
             sv_bounds: None,
@@ -324,14 +327,15 @@ impl ToolsWindow {
         }
         self.picking_color = true;
         self.pre_pick_hsv = (self.hue, self.sat, self.val);
-        // Seed with the *current* confirm-key state rather than `false`: the
-        // mouse button that activated this eyedropper (a literal
-        // `on_mouse_down`) is still physically held at this exact instant,
-        // so treating it as "already down" stops the very first poll tick
-        // from reading that same press as a fresh confirm at the button's
-        // own location (see the same reasoning in `poll_eyedropper`'s doc
-        // comment for the Enter case).
-        self.eyedropper_prev_confirm_key = key_down(VK_RETURN) || key_down(VK_LBUTTON);
+        self.screen_click = match eyedropper::ScreenClick::start() {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                eprintln!("issen: could not capture eyedropper clicks: {error}");
+                None
+            }
+        };
+        // Ignore the Enter press that started sampling, if it is still held.
+        self.eyedropper_prev_confirm_key = key_down(VK_RETURN);
         cx.notify();
 
         cx.spawn(async move |this, cx| loop {
@@ -360,11 +364,27 @@ impl ToolsWindow {
         }
         if key_down(VK_ESCAPE) {
             self.picking_color = false;
+            self.screen_click = None;
             // Cancelling restores the color from before picking started,
             // rather than leaving whatever pixel the cursor last happened
             // to be over.
             (self.hue, self.sat, self.val) = self.pre_pick_hsv;
             self.sync_hex(cx);
+            cx.notify();
+            return false;
+        }
+
+        if let Some(sample) = self
+            .screen_click
+            .as_ref()
+            .and_then(|click| click.take_sample())
+        {
+            if let Some((r, g, b)) = sample {
+                (self.hue, self.sat, self.val) = color::rgb_to_hsv(r, g, b);
+                self.sync_hex(cx);
+            }
+            self.picking_color = false;
+            self.screen_click = None;
             cx.notify();
             return false;
         }
@@ -382,17 +402,12 @@ impl ToolsWindow {
             }
         }
 
-        // Confirm on the rising edge (the moment Enter or the left mouse
-        // button goes down), not while held — otherwise the press that
-        // activated the eyedropper button itself would be picked up and
-        // confirm immediately. A left click lets the color be locked right
-        // at the target pixel — anywhere on screen, on any monitor — after
-        // which the cursor is free to move back to this window (e.g. to
-        // press the copy-hex button) without changing the picked color
-        // further; Enter remains as a keyboard-only alternative.
-        let confirm_down = key_down(VK_RETURN) || key_down(VK_LBUTTON);
+        // Mouse confirmation arrives from the hook, so even a click shorter
+        // than this timer interval is preserved. Enter remains an alternative.
+        let confirm_down = key_down(VK_RETURN);
         if confirm_down && !self.eyedropper_prev_confirm_key {
             self.picking_color = false;
+            self.screen_click = None;
         }
         self.eyedropper_prev_confirm_key = confirm_down;
         cx.notify();
@@ -885,7 +900,6 @@ impl Render for ToolsWindow {
 
 const VK_RETURN: i32 = 0x0D;
 const VK_ESCAPE: i32 = 0x1B;
-const VK_LBUTTON: i32 = 0x01;
 
 fn key_down(vk: i32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
