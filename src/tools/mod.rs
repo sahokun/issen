@@ -55,7 +55,7 @@ pub enum ToolKind {
 
 const SV_SIZE: (f32, f32) = (268.0, 160.0);
 const HUE_BAR_HEIGHT: f32 = 20.0;
-const COLOR_WINDOW_SIZE: (f32, f32) = (300.0, 540.0);
+const COLOR_WINDOW_SIZE: (f32, f32) = (300.0, 560.0);
 const UNITS_WINDOW_SIZE: (f32, f32) = (380.0, 440.0);
 const MIN_WINDOW_SIZE: (f32, f32) = (260.0, 300.0);
 
@@ -510,6 +510,92 @@ impl ToolsWindow {
             .child(glyph)
     }
 
+    fn eyedropper_guide(
+        &self,
+        palette: &GlassPalette,
+        accent: Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let strings = self.strings;
+        let active = self.picking_color;
+        let keycap = |label: &'static str| {
+            div()
+                .px(px(5.))
+                .py(px(2.))
+                .rounded(px(4.))
+                .bg(palette.control_bg)
+                .border_1()
+                .border_color(palette.control_border)
+                .text_color(palette.text)
+                .child(label)
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p(px(10.))
+            .rounded(px(10.))
+            .border_1()
+            .border_color(if active { accent } else { palette.border })
+            .bg(palette.control_bg)
+            .child(
+                div()
+                    .id("tool-eyedropper")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_size(rems(13. / 16.))
+                    .text_color(accent)
+                    .rounded(px(4.))
+                    .hover(|d| d.bg(palette.control_bg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| this.start_eyedropper(cx)),
+                    )
+                    .child(div().size(px(7.)).rounded_full().bg(accent))
+                    .child(if active {
+                        strings.eyedropper_sampling
+                    } else {
+                        strings.eyedropper_start
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(rems(11. / 16.))
+                    .text_color(palette.subtext)
+                    .child(if active {
+                        strings.eyedropper_sampling_hint
+                    } else {
+                        strings.eyedropper_hint
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1()
+                    .text_size(rems(11. / 16.))
+                    .text_color(palette.subtext)
+                    .child(keycap(strings.eyedropper_click))
+                    .child(strings.eyedropper_or)
+                    .child(keycap("Enter"))
+                    .child(strings.eyedropper_confirm),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_size(rems(11. / 16.))
+                    .text_color(palette.subtext)
+                    .child(keycap("Esc"))
+                    .child(strings.eyedropper_cancel),
+            )
+    }
+
     fn render_color_tab(
         &self,
         dark: bool,
@@ -561,24 +647,9 @@ impl ToolsWindow {
                         move |_, _, _cx| {
                             crate::launch::copy_to_clipboard(&hex_for_copy);
                         },
-                    ))
-                    .child(Self::icon_button(
-                        "tool-eyedropper",
-                        "\u{1F4A7}",
-                        strings.tool_eyedropper,
-                        dark,
-                        palette,
-                        cx.listener(|this, _, _, cx| this.start_eyedropper(cx)),
                     )),
             )
-            .when(self.picking_color, |d| {
-                d.child(
-                    div()
-                        .text_size(rems(11. / 16.))
-                        .text_color(palette.subtext)
-                        .child(SharedString::from(strings.eyedropper_hint)),
-                )
-            })
+            .child(self.eyedropper_guide(palette, accent, cx))
             .child(
                 div()
                     .flex()
