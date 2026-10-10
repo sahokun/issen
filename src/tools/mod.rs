@@ -38,9 +38,9 @@ use std::time::Duration;
 use gpui::{
     canvas, div, hsla, linear_color_stop, linear_gradient, point, prelude::*, px, rems, size,
     white, App, AppContext, Bounds, Context, Entity, Hsla, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels,
+    Point, Render, SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions,
 };
 
 use crate::config::{AccentColor, Theme, UiFont};
@@ -56,7 +56,7 @@ pub enum ToolKind {
 
 const SV_SIZE: (f32, f32) = (268.0, 160.0);
 const HUE_BAR_HEIGHT: f32 = 20.0;
-const COLOR_WINDOW_SIZE: (f32, f32) = (300.0, 560.0);
+const COLOR_WINDOW_SIZE: (f32, f32) = (300.0, 480.0);
 const UNITS_WINDOW_SIZE: (f32, f32) = (380.0, 440.0);
 const MIN_WINDOW_SIZE: (f32, f32) = (260.0, 300.0);
 
@@ -525,63 +525,108 @@ impl ToolsWindow {
             .child(glyph)
     }
 
-    fn eyedropper_guide(
+    /// Draw a pipette in a 24-unit coordinate space, independent of emoji fonts.
+    fn eyedropper_icon(ink: Hsla) -> impl IntoElement {
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let scale = bounds.size.width / 24.;
+                let p = |x, y| bounds.origin + point(scale * x, scale * y);
+                let mut tube = PathBuilder::stroke(px(1.6));
+                tube.move_to(p(14., 9.));
+                tube.line_to(p(5., 18.));
+                tube.line_to(p(4., 21.));
+                tube.line_to(p(7., 20.));
+                tube.line_to(p(16., 11.));
+                tube.close();
+                if let Ok(path) = tube.build() {
+                    window.paint_path(path, ink);
+                }
+                let mut bulb = PathBuilder::fill();
+                bulb.move_to(p(13., 7.));
+                bulb.line_to(p(17., 3.));
+                bulb.cubic_bezier_to(p(21., 7.), p(21., -1.), p(25., 3.));
+                bulb.line_to(p(17., 11.));
+                bulb.line_to(p(18., 12.));
+                bulb.line_to(p(16., 14.));
+                bulb.line_to(p(10., 8.));
+                bulb.line_to(p(12., 6.));
+                bulb.close();
+                if let Ok(path) = bulb.build() {
+                    window.paint_path(path, ink);
+                }
+            },
+        )
+        .size(px(18.))
+    }
+
+    fn eyedropper_button(
         &self,
+        dark: bool,
         palette: &GlassPalette,
         accent: Hsla,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let strings = self.strings;
         let active = self.picking_color;
+        div()
+            .id("tool-eyedropper")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(28.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(if active {
+                accent
+            } else {
+                gpui::transparent_black()
+            })
+            .when(active, |d| d.bg(palette.control_bg))
+            .cursor_pointer()
+            .hover(|d| d.bg(palette.control_bg))
+            .when(!active, |d| {
+                d.tooltip(ui_chrome::simple_tooltip(
+                    self.strings.tool_eyedropper,
+                    dark,
+                ))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.start_eyedropper(cx)),
+            )
+            .child(Self::eyedropper_icon(if active {
+                accent
+            } else {
+                palette.text
+            }))
+    }
+
+    fn eyedropper_guide(&self, palette: &GlassPalette, accent: Hsla) -> impl IntoElement {
+        let strings = self.strings;
         let keycap = |label: &'static str| {
             div()
-                .px(px(5.))
-                .py(px(2.))
-                .rounded(px(4.))
-                .bg(palette.control_bg)
+                .px(px(4.))
+                .rounded(px(3.))
                 .border_1()
                 .border_color(palette.control_border)
                 .text_color(palette.text)
                 .child(label)
         };
-
         div()
             .flex()
             .flex_col()
             .gap_2()
-            .p(px(10.))
-            .rounded(px(10.))
-            .border_1()
-            .border_color(if active { accent } else { palette.border })
-            .bg(palette.control_bg)
+            .pt(px(10.))
+            .border_t_1()
+            .border_color(palette.border)
+            .text_size(rems(11. / 16.))
+            .text_color(palette.subtext)
             .child(
                 div()
-                    .id("tool-eyedropper")
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .text_size(rems(13. / 16.))
-                    .text_color(accent)
-                    .rounded(px(4.))
-                    .hover(|d| d.bg(palette.control_bg))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, _, cx| this.start_eyedropper(cx)),
-                    )
-                    .child(div().size(px(7.)).rounded_full().bg(accent))
-                    .child(if active {
+                    .when(self.picking_color, |d| d.text_color(accent))
+                    .child(if self.picking_color {
                         strings.eyedropper_sampling
-                    } else {
-                        strings.eyedropper_start
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(rems(11. / 16.))
-                    .text_color(palette.subtext)
-                    .child(if active {
-                        strings.eyedropper_sampling_hint
                     } else {
                         strings.eyedropper_hint
                     }),
@@ -589,25 +634,27 @@ impl ToolsWindow {
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
                     .items_center()
-                    .gap_1()
-                    .text_size(rems(11. / 16.))
-                    .text_color(palette.subtext)
-                    .child(keycap(strings.eyedropper_click))
-                    .child(strings.eyedropper_or)
-                    .child(keycap("Enter"))
-                    .child(strings.eyedropper_confirm),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .text_size(rems(11. / 16.))
-                    .text_color(palette.subtext)
-                    .child(keycap("Esc"))
-                    .child(strings.eyedropper_cancel),
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(strings.eyedropper_click)
+                            .child("/")
+                            .child(keycap("Enter"))
+                            .child(strings.eyedropper_confirm),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(keycap("Esc"))
+                            .child(strings.eyedropper_cancel),
+                    ),
             )
     }
 
@@ -662,9 +709,9 @@ impl ToolsWindow {
                         move |_, _, _cx| {
                             crate::launch::copy_to_clipboard(&hex_for_copy);
                         },
-                    )),
+                    ))
+                    .child(self.eyedropper_button(dark, palette, accent, cx)),
             )
-            .child(self.eyedropper_guide(palette, accent, cx))
             .child(
                 div()
                     .flex()
@@ -703,6 +750,7 @@ impl ToolsWindow {
                             .child(format!("{hsl_h:.0}\u{b0}, {hsl_s:.0}%, {hsl_l:.0}%")),
                     ),
             )
+            .child(self.eyedropper_guide(palette, accent))
     }
 
     // --- Unit converter ---
