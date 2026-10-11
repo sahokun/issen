@@ -181,14 +181,20 @@ impl ToolsWindow {
         let (init_r, init_g, init_b) = (0xF2u8, 0xA9u8, 0x3Bu8);
         let (hue, sat, val) = color::rgb_to_hsv(init_r, init_g, init_b);
 
-        let hex_input = cx.new(|cx| TextInput::new(cx, color::to_hex(init_r, init_g, init_b), ""));
+        let hex_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                color::to_hex(init_r, init_g, init_b),
+                strings.color_input_placeholder,
+            )
+        });
         cx.observe(&hex_input, |this, entity, cx| {
             // Only reached for a genuine edit to the hex field itself
             // (typing, or a future direct `set_text` call) — programmatic
             // sync from the wheel/eyedropper uses `set_text_silent`, which
             // doesn't notify, specifically so it doesn't loop back here.
             let text = entity.read(cx).text().to_string();
-            if let Some((r, g, b)) = color::parse_hex(&text) {
+            if let Some((r, g, b)) = color::parse_input(&text) {
                 let (h, s, v) = color::rgb_to_hsv(r, g, b);
                 this.hue = h;
                 this.sat = s;
@@ -670,6 +676,22 @@ impl ToolsWindow {
         let swatch_color: Hsla = gpui::rgba(packed).into();
         let (hsl_h, hsl_s, hsl_l) = color::rgb_to_hsl(r, g, b);
         let hex_for_copy = color::to_hex(r, g, b);
+        let named_input = color::parse_named_color(self.hex_input.read(cx).text()).is_some();
+        // Pick black or white by relative luminance for a readable swatch label.
+        let linear = |channel: u8| {
+            let value = channel as f32 / 255.;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+        let swatch_ink = if luminance > 0.179 {
+            gpui::black()
+        } else {
+            gpui::white()
+        };
         let strings = self.strings;
 
         div()
@@ -685,7 +707,20 @@ impl ToolsWindow {
                     .rounded(px(6.))
                     .border_1()
                     .border_color(palette.border)
-                    .bg(swatch_color),
+                    .bg(swatch_color)
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .px(px(10.))
+                    .when(named_input, |d| {
+                        d.child(
+                            div()
+                                .font_family("Consolas")
+                                .text_size(rems(12. / 16.))
+                                .text_color(swatch_ink)
+                                .child(hex_for_copy.clone()),
+                        )
+                    }),
             )
             .child(
                 div()

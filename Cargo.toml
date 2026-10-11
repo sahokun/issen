@@ -25,6 +25,7 @@ raw-window-handle = "0.6"
 regex = "1"
 rfd = { version = "0.15", default-features = false, features = ["common-controls-v6"] }
 serde = { version = "1", features = ["derive"] }
+svgtypes = "0.16"
 toml = "1"
 tray-icon = { version = "0.24", default-features = false }
 unicode-segmentation = "1"

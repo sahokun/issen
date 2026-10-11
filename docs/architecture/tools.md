@@ -33,3 +33,12 @@ rather than as `SearchProvider` results.
   releases the hook, with cleanup deferred until mouse-up if confirmation
   is still held. Enter confirms the preview and Escape restores the color
   from before sampling.
+
+- The color input accepts six-digit hex and the 148 fixed CSS color names.
+  The typed name stays in the input; its canonical hex appears inside the
+  swatch only while a valid name is present. The label uses black or white
+  according to relative luminance. Copy always copies the canonical hex.
+  Wheel and eyedropper edits replace the input with hex, clearing the extra
+  label. Incomplete/invalid input preserves the last valid preview.
+  `svgtypes` provides CSS Color 3 names; `rebeccapurple` is handled explicitly.
+  `transparent` and contextual keywords are outside this opaque RGB picker.
