@@ -13,6 +13,26 @@ pub fn parse_hex(input: &str) -> Option<(u8, u8, u8)> {
     Some((r, g, b))
 }
 
+/// Parses the fixed, opaque CSS named colors, case-insensitively.
+/// Context-dependent keywords and transparency have no opaque RGB value.
+pub fn parse_named_color(input: &str) -> Option<(u8, u8, u8)> {
+    let name = input.trim();
+    if name.is_empty() || !name.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    let name = name.to_ascii_lowercase();
+    // svgtypes implements CSS Color 3; this name was added in Color 4.
+    if name == "rebeccapurple" {
+        return Some((102, 51, 153));
+    }
+    let parsed = name.parse::<svgtypes::Color>().ok()?;
+    (parsed.alpha == 255).then_some((parsed.red, parsed.green, parsed.blue))
+}
+
+pub fn parse_input(input: &str) -> Option<(u8, u8, u8)> {
+    parse_hex(input).or_else(|| parse_named_color(input))
+}
+
 pub fn to_hex(r: u8, g: u8, b: u8) -> String {
     format!("#{r:02X}{g:02X}{b:02X}")
 }
@@ -131,6 +151,35 @@ mod tests {
         // "aé345" is 1+2+1+1+1 = 6 bytes but not 6 chars; byte-index slicing here
         // would previously land mid-codepoint and panic.
         assert_eq!(parse_hex("aé345"), None);
+    }
+
+    #[test]
+    fn parses_css_names_and_preserves_css_channel_values() {
+        assert_eq!(parse_input("tomato"), Some((255, 99, 71)));
+        assert_eq!(parse_input("  RebeccaPurple  "), Some((102, 51, 153)));
+        assert_eq!(parse_input("GREEN"), Some((0, 128, 0)));
+        assert_eq!(parse_input("lime"), Some((0, 255, 0)));
+        assert_eq!(parse_input("gray"), parse_input("grey"));
+        assert_eq!(parse_input("aqua"), parse_input("cyan"));
+        assert_eq!(parse_input("lightgoldenrodyellow"), Some((250, 250, 210)));
+        assert_eq!(parse_input("#F2A93B"), Some((242, 169, 59)));
+    }
+
+    #[test]
+    fn rejects_incomplete_names_and_non_opaque_or_contextual_keywords() {
+        for input in [
+            "tom",
+            "nope",
+            "",
+            "色",
+            "transparent",
+            "currentcolor",
+            "inherit",
+            "Canvas",
+            "rgb(1,2,3)",
+        ] {
+            assert_eq!(parse_input(input), None, "{input}");
+        }
     }
 
     #[test]

@@ -30,6 +30,7 @@
 //!     `background_executor().timer(...)`, ticking roughly 60 times/sec
 //!     until Escape/Enter or the window closes.
 pub mod color;
+mod eyedropper;
 pub mod units;
 
 use std::time::Duration;
@@ -37,9 +38,9 @@ use std::time::Duration;
 use gpui::{
     canvas, div, hsla, linear_color_stop, linear_gradient, point, prelude::*, px, rems, size,
     white, App, AppContext, Bounds, Context, Entity, Hsla, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
-    Render, SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PathBuilder, Pixels,
+    Point, Render, SharedString, Styled, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions,
 };
 
 use crate::config::{AccentColor, Theme, UiFont};
@@ -55,7 +56,7 @@ pub enum ToolKind {
 
 const SV_SIZE: (f32, f32) = (268.0, 160.0);
 const HUE_BAR_HEIGHT: f32 = 20.0;
-const COLOR_WINDOW_SIZE: (f32, f32) = (300.0, 540.0);
+const COLOR_WINDOW_SIZE: (f32, f32) = (300.0, 480.0);
 const UNITS_WINDOW_SIZE: (f32, f32) = (380.0, 440.0);
 const MIN_WINDOW_SIZE: (f32, f32) = (260.0, 300.0);
 
@@ -150,6 +151,7 @@ pub struct ToolsWindow {
     /// pixel the cursor last happened to be over.
     pre_pick_hsv: (f32, f32, f32),
     eyedropper_prev_confirm_key: bool,
+    screen_click: Option<eyedropper::ScreenClick>,
     sv_dragging: bool,
     hue_dragging: bool,
     /// Window-space bounds of the SV square / hue bar's drag surface,
@@ -179,14 +181,20 @@ impl ToolsWindow {
         let (init_r, init_g, init_b) = (0xF2u8, 0xA9u8, 0x3Bu8);
         let (hue, sat, val) = color::rgb_to_hsv(init_r, init_g, init_b);
 
-        let hex_input = cx.new(|cx| TextInput::new(cx, color::to_hex(init_r, init_g, init_b), ""));
+        let hex_input = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                color::to_hex(init_r, init_g, init_b),
+                strings.color_input_placeholder,
+            )
+        });
         cx.observe(&hex_input, |this, entity, cx| {
             // Only reached for a genuine edit to the hex field itself
             // (typing, or a future direct `set_text` call) — programmatic
             // sync from the wheel/eyedropper uses `set_text_silent`, which
             // doesn't notify, specifically so it doesn't loop back here.
             let text = entity.read(cx).text().to_string();
-            if let Some((r, g, b)) = color::parse_hex(&text) {
+            if let Some((r, g, b)) = color::parse_input(&text) {
                 let (h, s, v) = color::rgb_to_hsv(r, g, b);
                 this.hue = h;
                 this.sat = s;
@@ -213,6 +221,7 @@ impl ToolsWindow {
             picking_color: false,
             pre_pick_hsv: (hue, sat, val),
             eyedropper_prev_confirm_key: false,
+            screen_click: None,
             sv_dragging: false,
             hue_dragging: false,
             sv_bounds: None,
@@ -324,14 +333,15 @@ impl ToolsWindow {
         }
         self.picking_color = true;
         self.pre_pick_hsv = (self.hue, self.sat, self.val);
-        // Seed with the *current* confirm-key state rather than `false`: the
-        // mouse button that activated this eyedropper (a literal
-        // `on_mouse_down`) is still physically held at this exact instant,
-        // so treating it as "already down" stops the very first poll tick
-        // from reading that same press as a fresh confirm at the button's
-        // own location (see the same reasoning in `poll_eyedropper`'s doc
-        // comment for the Enter case).
-        self.eyedropper_prev_confirm_key = key_down(VK_RETURN) || key_down(VK_LBUTTON);
+        self.screen_click = match eyedropper::ScreenClick::start() {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                eprintln!("issen: could not capture eyedropper clicks: {error}");
+                None
+            }
+        };
+        // Ignore the Enter press that started sampling, if it is still held.
+        self.eyedropper_prev_confirm_key = key_down(VK_RETURN);
         cx.notify();
 
         cx.spawn(async move |this, cx| loop {
@@ -360,11 +370,27 @@ impl ToolsWindow {
         }
         if key_down(VK_ESCAPE) {
             self.picking_color = false;
+            self.screen_click = None;
             // Cancelling restores the color from before picking started,
             // rather than leaving whatever pixel the cursor last happened
             // to be over.
             (self.hue, self.sat, self.val) = self.pre_pick_hsv;
             self.sync_hex(cx);
+            cx.notify();
+            return false;
+        }
+
+        if let Some(sample) = self
+            .screen_click
+            .as_ref()
+            .and_then(|click| click.take_sample())
+        {
+            if let Some((r, g, b)) = sample {
+                (self.hue, self.sat, self.val) = color::rgb_to_hsv(r, g, b);
+                self.sync_hex(cx);
+            }
+            self.picking_color = false;
+            self.screen_click = None;
             cx.notify();
             return false;
         }
@@ -382,17 +408,12 @@ impl ToolsWindow {
             }
         }
 
-        // Confirm on the rising edge (the moment Enter or the left mouse
-        // button goes down), not while held — otherwise the press that
-        // activated the eyedropper button itself would be picked up and
-        // confirm immediately. A left click lets the color be locked right
-        // at the target pixel — anywhere on screen, on any monitor — after
-        // which the cursor is free to move back to this window (e.g. to
-        // press the copy-hex button) without changing the picked color
-        // further; Enter remains as a keyboard-only alternative.
-        let confirm_down = key_down(VK_RETURN) || key_down(VK_LBUTTON);
+        // Mouse confirmation arrives from the hook, so even a click shorter
+        // than this timer interval is preserved. Enter remains an alternative.
+        let confirm_down = key_down(VK_RETURN);
         if confirm_down && !self.eyedropper_prev_confirm_key {
             self.picking_color = false;
+            self.screen_click = None;
         }
         self.eyedropper_prev_confirm_key = confirm_down;
         cx.notify();
@@ -510,6 +531,139 @@ impl ToolsWindow {
             .child(glyph)
     }
 
+    /// Draw a pipette in a 24-unit coordinate space, independent of emoji fonts.
+    fn eyedropper_icon(ink: Hsla) -> impl IntoElement {
+        canvas(
+            |_, _, _| {},
+            move |bounds, _, window, _| {
+                let scale = bounds.size.width / 24.;
+                let p = |x, y| bounds.origin + point(scale * x, scale * y);
+                let mut tube = PathBuilder::stroke(px(1.6));
+                tube.move_to(p(14., 9.));
+                tube.line_to(p(5., 18.));
+                tube.line_to(p(4., 21.));
+                tube.line_to(p(7., 20.));
+                tube.line_to(p(16., 11.));
+                tube.close();
+                if let Ok(path) = tube.build() {
+                    window.paint_path(path, ink);
+                }
+                let mut bulb = PathBuilder::fill();
+                bulb.move_to(p(13., 7.));
+                bulb.line_to(p(17., 3.));
+                bulb.cubic_bezier_to(p(21., 7.), p(21., -1.), p(25., 3.));
+                bulb.line_to(p(17., 11.));
+                bulb.line_to(p(18., 12.));
+                bulb.line_to(p(16., 14.));
+                bulb.line_to(p(10., 8.));
+                bulb.line_to(p(12., 6.));
+                bulb.close();
+                if let Ok(path) = bulb.build() {
+                    window.paint_path(path, ink);
+                }
+            },
+        )
+        .size(px(18.))
+    }
+
+    fn eyedropper_button(
+        &self,
+        dark: bool,
+        palette: &GlassPalette,
+        accent: Hsla,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let active = self.picking_color;
+        div()
+            .id("tool-eyedropper")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(px(28.))
+            .rounded(px(6.))
+            .border_1()
+            .border_color(if active {
+                accent
+            } else {
+                gpui::transparent_black()
+            })
+            .when(active, |d| d.bg(palette.control_bg))
+            .cursor_pointer()
+            .hover(|d| d.bg(palette.control_bg))
+            .when(!active, |d| {
+                d.tooltip(ui_chrome::simple_tooltip(
+                    self.strings.tool_eyedropper,
+                    dark,
+                ))
+            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.start_eyedropper(cx)),
+            )
+            .child(Self::eyedropper_icon(if active {
+                accent
+            } else {
+                palette.text
+            }))
+    }
+
+    fn eyedropper_guide(&self, palette: &GlassPalette, accent: Hsla) -> impl IntoElement {
+        let strings = self.strings;
+        let keycap = |label: &'static str| {
+            div()
+                .px(px(4.))
+                .rounded(px(3.))
+                .border_1()
+                .border_color(palette.control_border)
+                .text_color(palette.text)
+                .child(label)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .pt(px(10.))
+            .border_t_1()
+            .border_color(palette.border)
+            .text_size(rems(11. / 16.))
+            .text_color(palette.subtext)
+            .child(
+                div()
+                    .when(self.picking_color, |d| d.text_color(accent))
+                    .child(if self.picking_color {
+                        strings.eyedropper_sampling
+                    } else {
+                        strings.eyedropper_hint
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(strings.eyedropper_click)
+                            .child("/")
+                            .child(keycap("Enter"))
+                            .child(strings.eyedropper_confirm),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(keycap("Esc"))
+                            .child(strings.eyedropper_cancel),
+                    ),
+            )
+    }
+
     fn render_color_tab(
         &self,
         dark: bool,
@@ -522,6 +676,22 @@ impl ToolsWindow {
         let swatch_color: Hsla = gpui::rgba(packed).into();
         let (hsl_h, hsl_s, hsl_l) = color::rgb_to_hsl(r, g, b);
         let hex_for_copy = color::to_hex(r, g, b);
+        let named_input = color::parse_named_color(self.hex_input.read(cx).text()).is_some();
+        // Pick black or white by relative luminance for a readable swatch label.
+        let linear = |channel: u8| {
+            let value = channel as f32 / 255.;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
+        let swatch_ink = if luminance > 0.179 {
+            gpui::black()
+        } else {
+            gpui::white()
+        };
         let strings = self.strings;
 
         div()
@@ -537,7 +707,20 @@ impl ToolsWindow {
                     .rounded(px(6.))
                     .border_1()
                     .border_color(palette.border)
-                    .bg(swatch_color),
+                    .bg(swatch_color)
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .px(px(10.))
+                    .when(named_input, |d| {
+                        d.child(
+                            div()
+                                .font_family("Consolas")
+                                .text_size(rems(12. / 16.))
+                                .text_color(swatch_ink)
+                                .child(hex_for_copy.clone()),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -562,23 +745,8 @@ impl ToolsWindow {
                             crate::launch::copy_to_clipboard(&hex_for_copy);
                         },
                     ))
-                    .child(Self::icon_button(
-                        "tool-eyedropper",
-                        "\u{1F4A7}",
-                        strings.tool_eyedropper,
-                        dark,
-                        palette,
-                        cx.listener(|this, _, _, cx| this.start_eyedropper(cx)),
-                    )),
+                    .child(self.eyedropper_button(dark, palette, accent, cx)),
             )
-            .when(self.picking_color, |d| {
-                d.child(
-                    div()
-                        .text_size(rems(11. / 16.))
-                        .text_color(palette.subtext)
-                        .child(SharedString::from(strings.eyedropper_hint)),
-                )
-            })
             .child(
                 div()
                     .flex()
@@ -617,6 +785,7 @@ impl ToolsWindow {
                             .child(format!("{hsl_h:.0}\u{b0}, {hsl_s:.0}%, {hsl_l:.0}%")),
                     ),
             )
+            .child(self.eyedropper_guide(palette, accent))
     }
 
     // --- Unit converter ---
@@ -814,7 +983,6 @@ impl Render for ToolsWindow {
 
 const VK_RETURN: i32 = 0x0D;
 const VK_ESCAPE: i32 = 0x1B;
-const VK_LBUTTON: i32 = 0x01;
 
 fn key_down(vk: i32) -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
