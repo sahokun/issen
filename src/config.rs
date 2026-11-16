@@ -8,6 +8,9 @@ pub const APP_NAME: &str = "Issen";
 #[serde(default)]
 pub struct Config {
     pub hotkey: String,
+    /// Launch at Windows sign-in. Applied to `HKCU\...\CurrentVersion\Run`
+    /// by `src/autostart.rs` on settings save, and re-synced on every
+    /// release-build startup.
     pub autostart: bool,
     pub max_results: u32,
     pub theme: Theme,
@@ -69,7 +72,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             hotkey: "Alt+Space".to_string(),
-            autostart: true,
+            autostart: false,
             max_results: 6,
             theme: Theme::System,
             accent_color: AccentColor::Lime,

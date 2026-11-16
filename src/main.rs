@@ -8,6 +8,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 mod about_window;
 mod app;
+mod autostart;
 mod config;
 mod display;
 mod fonts;
@@ -30,5 +31,14 @@ fn main() {
     }
 
     let config = config::Config::load_or_default(config::APP_NAME);
+    // Release only: debug builds share %APPDATA%\Issen\config.toml with the
+    // release build, so syncing here would repoint the Run entry at
+    // target\debug\issen.exe (console subsystem). Saving from the settings
+    // window still applies the setting in debug builds.
+    if !cfg!(debug_assertions) {
+        if let Err(err) = autostart::apply(config.autostart) {
+            eprintln!("issen: failed to sync autostart: {err}");
+        }
+    }
     app::run(config);
 }

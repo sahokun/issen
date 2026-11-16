@@ -7,6 +7,11 @@ release.
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-16
+
+- Actually register Issen in Windows startup (HKCU Run) when "Launch Issen
+  when Windows starts" is enabled; the option now defaults to off.
+
 ## [0.3.1] - 2026-10-11
 
 - Accept CSS color names in the color picker, keeping the name in the input

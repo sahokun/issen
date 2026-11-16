@@ -1,6 +1,6 @@
 # Resident process & display model
 
-Covers: `src/app.rs`, `src/main.rs`, `src/settings_window.rs`, `src/about_window.rs`, `src/tools/**/*.rs`, `src/ui_chrome.rs`, `src/tray.rs`, `src/single_instance.rs`.
+Covers: `src/app.rs`, `src/main.rs`, `src/settings_window.rs`, `src/about_window.rs`, `src/tools/**/*.rs`, `src/ui_chrome.rs`, `src/tray.rs`, `src/single_instance.rs`, `src/autostart.rs`.
 
 "Fast startup" doesn't mean spawning a new process — it means **making an
 already-running hidden window instantly visible**.
@@ -140,3 +140,14 @@ already-running hidden window instantly visible**.
   intentionally never closed — `HANDLE` has no `Drop` impl, and holding it
   open *is* the mutex's lifetime; adding a `CloseHandle` call because it
   "looks discarded" would break single-instance enforcement.
+- Autostart ("Launch Issen when Windows starts", `config.autostart`,
+  default off) writes a quoted exe path to
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, value `Issen`
+  (`autostart.rs`). HKCU Run needs no elevation and no installer, which fits
+  zip distribution. It's applied when the settings window saves, and
+  re-synced on every **release** startup so the stored path follows the exe
+  if the user moves it. Debug builds skip the startup sync because they
+  share `%APPDATA%\Issen\config.toml` with the release build and would
+  otherwise repoint Run at `target\debug\issen.exe` (console subsystem).
+  Task Manager's Startup-tab "Disable" lives separately under
+  `Explorer\StartupApproved\Run` and is intentionally not touched.

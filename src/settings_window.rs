@@ -424,6 +424,9 @@ impl SettingsWindow {
                                 if let Err(err) = app.config.save(config::APP_NAME) {
                                     eprintln!("issen: failed to save config.toml: {err}");
                                 }
+                                if let Err(err) = crate::autostart::apply(app.config.autostart) {
+                                    eprintln!("issen: failed to apply autostart: {err}");
+                                }
                             });
                         }
                     })
