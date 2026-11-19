@@ -23,8 +23,7 @@
 //! `WM_MOVE`経由でGPUI内部のbounds()キャッシュが追従しているかもここで見える
 //! (これが古い値のままならGPUI内部状態とのズレがある = 要注意)。
 //!
-//! 実行: `cargo run --example gpui_spike`(Windows専用。WSL側ではrustcバージョン
-//! 不足のためビルド不可 — Windows側のPowerShellで実行すること)。
+//! 実行: `cargo run --example gpui_spike`(Windows専用)。
 
 use gpui::{
     actions, div, prelude::*, px, rgba, size, white, App, Bounds, Context, FocusHandle, Focusable,

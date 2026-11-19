@@ -69,11 +69,6 @@ cargo fmt --check
 cargo test
 ```
 
-From WSL, run these through `scripts/wcargo.sh` (e.g. `scripts/wcargo.sh
-test`), which calls the Windows-side `cargo.exe` with the target dir moved
-to `%LOCALAPPDATA%\issen-wsl-target` — building straight into the
-`\\wsl.localhost` checkout fails on incremental-compilation lock files.
-
 Keep commits scoped to a single logical change rather than bundling
 unrelated work together — it keeps `git log` useful for tracing why a
 specific change was made.
