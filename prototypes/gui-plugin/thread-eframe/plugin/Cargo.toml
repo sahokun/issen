@@ -8,6 +8,6 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
-egui = "0.36"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.37"
 winit = "0.30"

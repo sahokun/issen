@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
-egui = "0.36"
-libloading = "0.8"
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts"] }
+egui = "0.37"
+libloading = "0.9"
