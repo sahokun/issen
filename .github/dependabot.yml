@@ -6,19 +6,7 @@ version: 2
 # With a develop branch, add target-branch: develop to each block.
 updates:
   - package-ecosystem: cargo
-    directories:
-      - /
-      - /plugin-api
-      - /plugin-example
-      - /prototypes/gui-plugin/raw-window
-      - /prototypes/gui-plugin/raw-window/host
-      - /prototypes/gui-plugin/raw-window/plugin
-      - /prototypes/gui-plugin/setparent
-      - /prototypes/gui-plugin/setparent/host
-      - /prototypes/gui-plugin/setparent/plugin
-      - /prototypes/gui-plugin/thread-eframe
-      - /prototypes/gui-plugin/thread-eframe/host
-      - /prototypes/gui-plugin/thread-eframe/plugin
+    directory: /
     open-pull-requests-limit: 2
     schedule:
       interval: monthly
