@@ -6,3 +6,4 @@
 # root workspace (see prototypes/gui-plugin/README.md), so their target/
 # directories aren't caught by the root /target entry above.
 /prototypes/*/*/target
+.env
